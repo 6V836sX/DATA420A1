@@ -1,0 +1,67 @@
+from pyspark.sql import functions as F
+
+# -----------------------------
+# 1) Basic station-level statistics (without using collect_set)
+# -----------------------------
+base_stats = (
+    inventory_df
+    .groupBy("ID")
+    .agg(
+        F.min("FIRSTYEAR").alias("FIRSTYEAR_ANY"),
+        F.max("LASTYEAR").alias("LASTYEAR_ANY"),
+        F.countDistinct("ELEMENT").alias("N_ELEMENTS")
+    )
+)
+
+# -----------------------------
+# 2) Filter by element type first (as suggested in the assignment)
+#    Create one-hot indicator columns for the core elements
+# -----------------------------
+core = ["TMAX", "TMIN", "PRCP", "SNOW", "SNWD"]
+
+# Keep only core elements and deduplicate by (station, element)
+core_pairs = (
+    inventory_df
+    .filter(F.col("ELEMENT").isin(core))
+    .select("ID", "ELEMENT")
+    .distinct()
+)
+
+# Pivot to wide format (each core element becomes a 0/1 indicator)
+# Note: use count(*) > 0 → converted to 1/0
+core_flags = (
+    core_pairs
+    .groupBy("ID")
+    .pivot("ELEMENT", core)
+    .agg(F.count(F.lit(1)))
+    .na.fill(0)
+)
+
+# Optionally: convert counts to explicit 0/1 (can be omitted if already 0/1)
+for el in core:
+    core_flags = core_flags.withColumn(el, (F.col(el) > 0).cast("int"))
+
+# -----------------------------
+# 3) Merge: base stats + core element indicators
+# -----------------------------
+inv_by_station = (
+    base_stats
+    .join(core_flags, on="ID", how="left")
+    .na.fill(0, subset=core)  # fill missing core elements with 0
+    .withColumn("N_CORE_ELEMENTS", sum(F.col(el) for el in core))
+)
+
+# Example: answer the question
+n_all_five_core = inv_by_station.filter(F.col("N_CORE_ELEMENTS") == 5).count()
+
+# “Only PRCP” under two definitions
+# (a) Strict definition: only PRCP and no other elements
+n_prcp_only_strict = inv_by_station.filter(
+    (F.col("N_ELEMENTS") == 1) & (F.col("PRCP") == 1)
+).count()
+
+# (b) Core definition: only PRCP among the core elements (non-core allowed)
+n_prcp_only_core = inv_by_station.filter(
+    (F.col("PRCP") == 1) &
+    sum(F.col(el) for el in ["TMAX","TMIN","SNOW","SNWD"]) == 0
+).count()
