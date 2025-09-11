@@ -1,0 +1,1 @@
+hdfs dfs -text wasbs://campus-data@madsstorage002.blob.core.windows.net/ghcnd/daily/2023.csv.gz | head -n 5
