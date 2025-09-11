@@ -1,0 +1,31 @@
+from pyspark.sql import functions as F
+
+# 1) 解析 DATE：YYYYMMDD -> DateType
+daily_2025 = daily_2025.withColumn("DATE", F.to_date(F.col("DATE"), "yyyyMMdd"))
+
+# 2) 预处理 TIME 列：有的为空/空格/不足4位，先清洗并左侧补零到4位
+daily_2025 = daily_2025.withColumn(
+    "TIME_CLEAN",
+    F.when(F.col("TIME").isNull() | (F.trim(F.col("TIME")) == ""), None)
+     .otherwise(F.lpad(F.col("TIME").cast("string"), 4, "0"))
+)
+
+# 3) 组合“虚拟日期 + HHmm”转成 TimestampType（需要完整日期时间格式）
+daily_2025 = daily_2025.withColumn(
+    "OBS_TS",
+    F.when(F.col("TIME_CLEAN").isNull(), None)
+     .otherwise(F.to_timestamp(
+         F.concat(F.lit("1970-01-01 "), F.col("TIME_CLEAN")),  # -> "1970-01-01 HHmm"
+         "yyyy-MM-dd HHmm"
+     ))
+)
+
+# 4) 如果你还想要展示用的 "HH:mm" 字符串列
+daily_2025 = daily_2025.withColumn(
+    "OBS_HHMM",
+    F.when(F.col("OBS_TS").isNull(), None)
+     .otherwise(F.date_format(F.col("OBS_TS"), "HH:mm"))
+)
+
+daily_2025.printSchema()
+daily_2025.show(20, truncate=False)
