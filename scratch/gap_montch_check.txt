@@ -1,33 +1,53 @@
 from pyspark.sql import functions as F
 
-# 1) 月存在性明细（有任意一天就算该月出现）
-month_presence = (
+# ===== 0) Get year range dynamically (do not hardcode) =====
+yr_min_max = (daily_nz_tmin_tmax
+              .agg(F.min(F.year("DATE")).alias("min_y"),
+                   F.max(F.year("DATE")).alias("max_y"))).first()
+min_y, max_y = int(yr_min_max["min_y"]), int(yr_min_max["max_y"])
+
+# ===== 1) Dimension tables: station / year / month =====
+# Station table: you already have nz_station_ids (small table).
+# If IDs are not guaranteed unique, apply distinct upstream.
+ids_df    = nz_station_ids.select("ID")           
+years_df  = (spark.range(min_y, max_y + 1)
+             .withColumnRenamed("id", "year"))
+months_df = (spark.range(1, 13)
+             .withColumnRenamed("id", "month"))
+
+# Cartesian product to generate the full (ID, year, month) frame
+# Expected size = num_stations × num_years × 12
+full_frame = (ids_df
+              .crossJoin(years_df)
+              .crossJoin(months_df))
+
+# ===== 2) Observed (ID, year, month) combinations =====
+# Instead of distinct, aggregate with groupBy once
+obs_by_month = (
     daily_nz_tmin_tmax
-    .select(
-        F.col("ID"),
-        F.year("DATE").alias("year"),
-        F.month("DATE").alias("month")
-    )
-    .where(F.col("month").isNotNull())  # 保险：排除异常空月
-    .distinct()
+      .select(
+          F.col("ID"),
+          F.year("DATE").alias("year"),
+          F.month("DATE").alias("month")
+      )
+      .groupBy("ID", "year", "month")
+      .agg(F.count(F.lit(1)).alias("cnt"))    # just to prove existence
+      .select("ID", "year", "month")          # reduce back to presence set
 )
 
-# 2) 对 (ID, year) 收集该年出现过的月份集合 => months_seen
-by_id_year = (
-    month_presence
-    .groupBy("ID", "year")
-    .agg(F.collect_set("month").alias("months_seen"))
+# ===== 3) Find missing (expected minus observed) =====
+# full_frame is small (≈15k rows), so use it as left table with left_anti join
+missing = (
+    full_frame
+      .join(obs_by_month, on=["ID", "year", "month"], how="left_anti")
 )
 
-# 3) 计算缺失月份：array_except([1..12], sort(months_seen))
-all_months = F.sequence(F.lit(1), F.lit(12))
-gaps_no_udf = (
-    by_id_year
-    .withColumn("missing_months", F.array_except(all_months, F.array_sort("months_seen")))
-    .filter(F.size("missing_months") > 0)
-    .select("ID", "year", "months_seen", "missing_months")
-    # 排序：先 ID、年，再按“缺失月数量”，最后按缺失月份数组字典序
-    .orderBy("ID", "year", F.size("missing_months"), F.col("missing_months"))
+# ===== 4) Aggregate missing months for each (ID, year) =====
+gaps_by_id_year = (
+    missing
+      .groupBy("ID", "year")
+      .agg(F.collect_list("month").alias("missing_months"))
+      .orderBy("ID", "year", F.size("missing_months"), F.col("missing_months"))
 )
 
-gaps_no_udf.show(100, truncate=False)
+gaps_by_id_year.show(100, truncate=False)
