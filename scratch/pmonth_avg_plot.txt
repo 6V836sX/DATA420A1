@@ -1,13 +1,14 @@
-# 仅保留绘图需要列 & 类型优化
+# Keep only the columns needed for plotting & optimize types
 pdf = pdf[["ID", "month_start", "TMIN_avg", "TMAX_avg"]]
 pdf["ID"] = pdf["ID"].astype("category")
 
-# ===== 1) 对齐：为每个ID补齐 1940-01 ~ 2025-12 的完整月序列（缺的保持NaN） =====
+# ===== 1) Alignment: reindex each station to a full monthly sequence (1940-01 ~ 2025-12) =====
+# Missing months are kept as NaN so that gaps remain visible in the plots
 full_index = pd.date_range("1940-01-01", "2025-12-01", freq="MS")  # Month Start
 
 def reindex_station(g):
     g = (g.set_index("month_start")[["TMIN_avg", "TMAX_avg"]]
-           .reindex(full_index))  # missing value to NaN → no data when plotting
+           .reindex(full_index))  # Fill missing months with NaN
     g.index.name = "month_start"
     return g
 
@@ -17,14 +18,14 @@ for sid, g in pdf.groupby("ID", observed=True):
     gg["ID"] = sid
     blocks.append(gg.reset_index())
 
-aligned = pd.concat(blocks, ignore_index=True)   # col：month_start, TMIN_avg, TMAX_avg, ID
+aligned = pd.concat(blocks, ignore_index=True)   # Final columns: month_start, TMIN_avg, TMAX_avg, ID
 aligned = aligned[["ID", "month_start", "TMIN_avg", "TMAX_avg"]]
 
-# ===== 2) plotting 15 station setup（customised available when you use selected_ids to replace next line）=====
+# ===== 2) Select 15 stations to plot (default: first 15, or replace with custom IDs) =====
 ids_all = aligned["ID"].astype("category").cat.categories.tolist()
-ids_15 = ids_all[:15]   # or customisation：ids_15 = ["NZ000093012", "...", ...]
+ids_15 = ids_all[:15]   # Example customization: ids_15 = ["NZ000093012", "...", ...]
 
-# ===== 3) 15 subplots（同一坐标轴上画 TMIN / TMAX，统一x轴范围） =====
+# ===== 3) Create 15 subplots (each station in its own axis, plot TMIN/TMAX with same x-range) =====
 import matplotlib.pyplot as plt
 
 nrows, ncols = 3, 5
@@ -42,15 +43,18 @@ for ax, sid in zip(axes, ids_15):
     ax.set_xlim(x_min, x_max)
     ax.grid(True, alpha=0.3)
 
-# hide balck subplot
+# Hide unused subplots (in case there are fewer than 15 stations)
 for k in range(len(ids_15), len(axes)):
     axes[k].axis("off")
 
-# page level layout
+# Add a shared legend and overall layout adjustments
 handles, labels = axes[0].get_legend_handles_labels()
 fig.legend(handles, labels, loc="lower center", ncol=2)
 
-fig.suptitle("NZ Stations • Monthly Mean TMIN/TMAX (NaN gaps, aligned 1940–2025)", y=0.98, fontsize=12)
+fig.suptitle("NZ Stations • Monthly Mean TMIN/TMAX (NaN gaps, aligned 1940–2025)", 
+             y=0.98, fontsize=12)
 fig.tight_layout(rect=[0, 0.04, 1, 0.96])
 plt.show()
+
+# Save figure
 fig.savefig("./supplementary/nz_15stations_tmin_tmax_monthly_avg.png", dpi=300)
