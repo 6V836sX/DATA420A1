@@ -1,53 +1,75 @@
-# === Choropleth: station counts by country (spatial join; no FIPS mapping needed) ===
-import geopandas as gpd
+# ============================================================
+# Global PRCP stations → country counts (choropleth)
+# Robust Spark→pandas conversion + spatial join (no FIPS mapping)
+# ============================================================
+
+import os
 import pandas as pd
-import numpy as np
+import geopandas as gpd
 import matplotlib.pyplot as plt
 
-# 1) Spark → pandas（只取需要的列）
-pts_pdf = (prcp_stations
-           .select("ID", "COUNTRY_CODE", "LATITUDE", "LONGITUDE")
-           .dropna()
-           .toPandas())
+# ---------- 0) Spark to Pandas: robust loader ----------
+spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
 
-# 2) 点 → GeoDataFrame（WGS84）
+slim = (
+    prcp_stations
+    .select("ID", "COUNTRY_CODE", "LATITUDE", "LONGITUDE")
+    .dropna()
+    # 保险起见，去掉越界经纬度
+    .filter((F.col("LATITUDE").between(-90, 90)) & (F.col("LONGITUDE").between(-180, 180)))
+)
+
+def spark_to_pandas_robust(df, tmp_dir="/tmp/prcp_pts_tmp"):
+    """Try Arrow .toPandas(); on failure, write Parquet and read via pandas."""
+    try:
+        return df.toPandas()
+    except Exception as e:
+        print("[Warn] toPandas failed, fallback to Parquet → pandas. Reason:", repr(e))
+        # 写到本地 Parquet（单分片，避免读多个文件）
+        df.coalesce(1).write.mode("overwrite").parquet(tmp_dir)
+        # 找到真正的数据文件（part-*.parquet）
+        part_files = [f for f in os.listdir(tmp_dir) if f.endswith(".parquet")]
+        assert part_files, f"No parquet part found under {tmp_dir}"
+        pq_path = os.path.join(tmp_dir, part_files[0])
+        return pd.read_parquet(pq_path)
+
+pts_pdf = spark_to_pandas_robust(slim)
+
+# ---------- 1) GeoDataFrames ----------
 gdf_pts = gpd.GeoDataFrame(
     pts_pdf,
     geometry=gpd.points_from_xy(pts_pdf["LONGITUDE"], pts_pdf["LATITUDE"]),
-    crs="EPSG:4326"
+    crs="EPSG:4326"   # WGS84
 )
 
-# 3) 世界底图（同样保持 WGS84，便于空间连接）
 world = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres")).to_crs(4326)
-world = world[~world["iso_a3"].isin(["-99"])]   # 去掉无效记录
+world = world[~world["iso_a3"].isin(["-99"])][["iso_a3", "name", "geometry"]]
 
-# 4) 空间连接：给每个站点匹配其所属国家多边形
-#    需要安装 rtree 或 pygeos/shapely>=2 的空间索引以加速
-pts_with_country = gpd.sjoin(gdf_pts, world[["iso_a3", "name", "geometry"]],
-                             how="left", predicate="within")
+# ---------- 2) Spatial join: point-in-country ----------
+# 需要 rtree 或 shapely>=2 的空间索引以加速
+pts_with_country = gpd.sjoin(gdf_pts, world, how="left", predicate="within")
 
-# 5) 按国家统计站点数（使用 Natural Earth 的 iso_a3/name）
+# ---------- 3) Count by country & merge back ----------
 counts = (pts_with_country
           .groupby(["iso_a3", "name"], dropna=False)
           .size()
           .reset_index(name="station_count"))
 
-# 6) 合并回世界多边形，缺失填 0（例如远海小岛或匹配失败的点）
 world_counts = world.merge(counts, on=["iso_a3", "name"], how="left")
 world_counts["station_count"] = world_counts["station_count"].fillna(0).astype(int)
 
-# 7) 绘图（分位数分级更均衡；或换成 natural breaks）
+# ---------- 4) Choropleth ----------
 fig, ax = plt.subplots(figsize=(16, 8))
 world_counts.plot(
     ax=ax,
     column="station_count",
     cmap="viridis",
-    scheme="quantiles",   # 分位数分级，让颜色分布更均衡
-    k=7,                  # 分 7 档
+    scheme="quantiles",  # 分位数分级，颜色分布更均匀
+    k=7,
     edgecolor="#d9d9d9",
     linewidth=0.4,
     legend=True,
-    legend_kwds={"label": "Number of PRCP Stations (by country)", "loc": "lower left"}
+    legend_kwds={"label": "Number of PRCP Stations (by country)", "loc": "lower left"},
 )
 ax.set_axis_off()
 ax.set_title(
@@ -59,7 +81,7 @@ plt.tight_layout()
 plt.savefig("./supplementary/global_prcp_stations_choropleth.png", dpi=220, bbox_inches="tight")
 plt.show()
 
-# Optional：导出国家计数表
-(out_path := "./supplementary/prcp_station_counts_by_country.csv")
-world_counts[["iso_a3", "name", "station_count"]].to_csv(out_path, index=False)
-print("Saved:", out_path)
+# ---------- 5) Export table ----------
+out_csv = "./supplementary/prcp_station_counts_by_country.csv"
+world_counts[["iso_a3", "name", "station_count"]].to_csv(out_csv, index=False)
+print("Saved:", out_csv)
