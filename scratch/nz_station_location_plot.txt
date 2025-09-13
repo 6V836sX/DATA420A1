@@ -1,9 +1,7 @@
 # === Imports ===
 import geopandas as gpd
 import matplotlib.pyplot as plt
-import pandas as pd
-import numpy as np
-from pyspark.sql import functions as F
+
 
 # ------------------------------------------------------------
 # 1) Station table（Spark→pandas）
@@ -75,7 +73,7 @@ vmax = float(np.nanmax(vals)) if np.nanmax(vals) > 0 else 1.0
 gdf_pts_nztm.plot(
     ax=ax,
     column="obs_count",
-    cmap="Blues",            # 深=多，浅=少
+    cmap="Reds",            # 深=多，浅=少
     markersize=80,
     linewidth=0.4,
     edgecolor="white",
@@ -98,8 +96,8 @@ for _, r in gdf_pts_nztm.iterrows():
 
 # 6d) 视图范围 & 标题
 minx, miny, maxx, maxy = nz_poly.total_bounds
-pad_x = (maxx - minx) * 0.05
-pad_y = (maxy - miny) * 0.05
+pad_x = (maxx - minx) * 0.5
+pad_y = (maxy - miny) * 0.5
 ax.set_xlim(minx - pad_x, maxx + pad_x)
 ax.set_ylim(miny - pad_y, maxy + pad_y)
 ax.set_axis_off()
@@ -111,7 +109,7 @@ ax.set_title(
 
 # 6e) 独立色条（右侧）
 cax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
-sm = plt.cm.ScalarMappable(cmap="Blues",
+sm = plt.cm.ScalarMappable(cmap="Reds",
                            norm=plt.Normalize(vmin=vmin, vmax=vmax))
 sm._A = []
 cbar = fig.colorbar(sm, cax=cax)
