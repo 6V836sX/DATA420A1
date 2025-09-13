@@ -1,0 +1,130 @@
+# 0) Parameters
+MIN_MONTHS = 9  # set to 10 if you want a stricter threshold
+VALUE_IN_TENTHS = False  # set True if raw VALUE is in tenths of °C
+
+
+# 1) Spark — null invalid yearly means (variant B)
+
+# 1) Monthly means per (ID, ELEMENT, year, month)
+monthly_means = (
+    daily_nz_tmin_tmax
+    .select("ID", "DATE", "ELEMENT", "VALUE")
+    .withColumn("DATE", F.to_date("DATE"))
+    .withColumn("year", F.year("DATE"))
+    .withColumn("month", F.month("DATE"))
+    .groupBy("ID", "ELEMENT", "year", "month")
+    .agg(F.avg("VALUE").alias("monthly_mean"))
+)
+
+# 2) Yearly stats per (ID, ELEMENT, year): count months and average of monthly means
+year_stats = (
+    monthly_means
+    .groupBy("ID", "ELEMENT", "year")
+    .agg(
+        F.count("*").alias("months_present"),
+        F.avg("monthly_mean").alias("year_mean_raw")
+    )
+    .withColumn(
+        "year_mean",
+        F.when(F.col("months_present") >= F.lit(MIN_MONTHS), F.col("year_mean_raw")).otherwise(F.lit(None))
+    )
+)
+
+# 3) Pivot to wide format with NULLs where months_present < MIN_MONTHS
+pyear_all = (
+    year_stats
+    .groupBy("ID", "year")
+    .pivot("ELEMENT", ["TMIN", "TMAX"])
+    .agg(F.first("year_mean"))
+    .withColumnRenamed("TMIN", "TMIN_avg")
+    .withColumnRenamed("TMAX", "TMAX_avg")
+)
+
+# (Optional) diagnostics: months_present by element, for QC or annotation
+months_diag = (
+    year_stats
+    .groupBy("ID", "year")
+    .pivot("ELEMENT", ["TMIN", "TMAX"])
+    .agg(F.first("months_present"))
+    .withColumnRenamed("TMIN", "TMIN_months")
+    .withColumnRenamed("TMAX", "TMAX_months")
+)
+
+# Join diagnostics if you want them available downstream (safe to skip if not needed)
+pyear_all = pyear_all.join(months_diag, on=["ID", "year"], how="left")
+
+
+# 2) Pandas — align to full yearly index (1940–2025), keep NaN for gaps
+import pandas as pd
+spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
+
+pdfy = pyear_all.toPandas()
+
+# Convert units if raw values are tenths of °C
+if VALUE_IN_TENTHS:
+    for col in ["TMIN_avg", "TMAX_avg"]:
+        if col in pdfy.columns:
+            pdfy[col] = pdfy[col] / 10.0
+
+pdfy["ID"] = pdfy["ID"].astype("category")
+pdfy["year_start"] = pd.to_datetime(pdfy["year"].astype(str) + "-01-01", errors="coerce")
+
+# Keep only plotting columns (keep diagnostics if you want to annotate)
+keep_cols = ["ID", "year_start", "TMIN_avg", "TMAX_avg"]
+diag_cols = [c for c in ["TMIN_months", "TMAX_months"] if c in pdfy.columns]
+pdfy = pdfy[keep_cols + diag_cols]
+
+# Build full yearly index 1940–2025
+full_years = pd.date_range("1940-01-01", "2025-01-01", freq="YS")
+
+def reindex_station_year(g):
+    g2 = g.set_index("year_start").reindex(full_years)
+    g2.index.name = "year_start"
+    return g2
+
+blocks = []
+for sid, g in pdfy.groupby("ID", observed=True):
+    gg = reindex_station_year(g)
+    gg["ID"] = sid
+    blocks.append(gg.reset_index())
+
+aligned_year = pd.concat(blocks, ignore_index=True)
+aligned_year = aligned_year[["ID", "year_start", "TMIN_avg", "TMAX_avg"] + diag_cols]
+
+# 3) Matplotlib — 15 subplots, TMIN/TMAX per station, aligned 1940–2025
+import matplotlib.pyplot as plt
+
+ids_all = aligned_year["ID"].drop_duplicates().tolist()
+ids_15 = ids_all[:15]  # customize this selection if needed
+
+nrows, ncols = 3, 5
+fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(20, 10), sharex=True)
+axes = axes.ravel()
+
+x_min, x_max = pd.Timestamp("1940-01-01"), pd.Timestamp("2025-12-31")
+# Optional fixed y-limits for comparability across stations (adjust ranges as needed)
+# y_min, y_max = -5, 40
+
+for ax, sid in zip(axes, ids_15):
+    g = aligned_year[aligned_year["ID"] == sid]
+    ax.plot(g["year_start"], g["TMIN_avg"], label="TMIN")
+    ax.plot(g["year_start"], g["TMAX_avg"], label="TMAX")
+    ax.set_title(str(sid), fontsize=10)
+    ax.set_xlim(x_min, x_max)
+    # ax.set_ylim(y_min, y_max)
+    ax.grid(True, alpha=0.3)
+
+# Hide unused subplots if fewer than 15 stations
+for k in range(len(ids_15), len(axes)):
+    axes[k].axis("off")
+
+# Shared legend and layout
+handles, labels = axes[0].get_legend_handles_labels()
+fig.legend(handles, labels, loc="lower center", ncol=2)
+fig.suptitle("NZ Stations • Yearly Mean TMIN/TMAX (NaN gaps via month coverage threshold, aligned 1940–2025)",
+             y=0.98, fontsize=12)
+fig.tight_layout(rect=[0, 0.04, 1, 0.96])
+
+# Show and/or save
+# plt.show()
+fig.savefig("./supplementary/nz_15stations_tmin_tmax_yearly_avg_filtered_null.png", dpi=300)
