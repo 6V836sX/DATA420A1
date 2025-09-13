@@ -79,23 +79,32 @@ ax.set_title(
     fontsize=13
 )
 
-# 8) 自定义气泡图例（示例取 3 个刻度）
-for legend_val in [100, 1000, int(c_max)]:
+# 8) 自定义气泡图例（计算 5 个分级刻度（对数刻度更均匀））
+legend_vals = [50, 200, 1_000, 5_000, int(c_max)]
+
+for legend_val in legend_vals:
     if legend_val <= 0 or legend_val > c_max:
         continue
-    # 复用同样的缩放函数计算对应面积
-    area = min_size + (max_size - min_size) * (math.sqrt(legend_val) - math.sqrt(max(1.0, c_min))) / (math.sqrt(c_max) - math.sqrt(max(1.0, c_min)))
-    plt.scatter([], [], s=area, color="#1f77b4", alpha=0.65, edgecolors="white", linewidths=0.3,
-                label=f"{legend_val:,}")
+    # 用同样的缩放公式计算面积
+    area = min_size + (max_size - min_size) * (
+        (math.sqrt(legend_val) - math.sqrt(max(1.0, c_min)))
+        / (math.sqrt(c_max) - math.sqrt(max(1.0, c_min)))
+    )
+    plt.scatter([], [], s=area, color="#1f77b4", alpha=0.65,
+                edgecolors="white", linewidths=0.3, label=f"{legend_val:,}")
 
 leg = ax.legend(
-    scatterpoints=1, frameon=True, labelspacing=1.2, title="Stations",
-    loc="lower left", bbox_to_anchor=(0.02, 0.02)
+    scatterpoints=1,
+    frameon=True,
+    labelspacing=1.2,
+    title="Stations",
+    loc="lower left",
+    bbox_to_anchor=(0.02, 0.02),
 )
 leg.get_title().set_fontsize(10)
 
 plt.tight_layout()
-plt.savefig("./supplementary/global_prcp_stations_bubble.png", dpi=220, bbox_inches="tight")
+plt.savefig("./supplementary/global_prcp_stations_bubble.png", dpi=300, bbox_inches="tight")
 plt.show()
 
 # 9) 导出聚合表
