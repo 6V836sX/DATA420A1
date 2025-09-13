@@ -1,0 +1,111 @@
+# --------------------------------------------
+# NZ monthly area-weighted national means for TMIN / TMAX
+# Time stratification (by month) + Voronoi area weights + availability renormalization
+# --------------------------------------------
+import pandas as pd
+import numpy as np
+import geopandas as gpd
+from shapely.ops import voronoi_diagram
+
+# ========= 0) PARAMETERS =========
+# 月度有效性的日数阈值（例如：一个月至少20天有观测才认为该月有效）
+MIN_DAYS_PER_MONTH = 20
+
+# ========= 1) LOAD / PREPARE TABULAR DATA =========
+# daily_nz_tmin_tmax: Spark DataFrame with columns: ID, DATE (yyyy-mm-dd), TMIN, TMAX
+# nz_station_loc: Spark DataFrame with columns: ID, LATITUDE, LONGITUDE
+
+# to pandas
+daily_pdf = daily_nz_tmin_tmax.select("ID", "DATE", "TMIN", "TMAX").toPandas().copy()
+stations_pdf = nz_station_loc.select("ID", "LATITUDE", "LONGITUDE").toPandas().copy()
+
+# parse dates & make month_start
+daily_pdf["DATE"] = pd.to_datetime(daily_pdf["DATE"])
+daily_pdf["month_start"] = daily_pdf["DATE"].values.astype("datetime64[M]")  # month floor
+
+# ========= 2) STATION-MONTH AGGREGATION + QC =========
+# per-station per-month: mean TMIN/TMAX + #days present
+monthly_station = (daily_pdf
+    .groupby(["ID", "month_start"], as_index=False)
+    .agg(TMIN_avg=("TMIN", "mean"),
+         TMAX_avg=("TMAX", "mean"),
+         days_present=("DATE", "nunique"))
+)
+monthly_station["is_valid"] = monthly_station["days_present"] >= MIN_DAYS_PER_MONTH
+
+# ========= 3) VORONOI AREA WEIGHTS (SPATIAL) =========
+# 3.1 stations -> GeoDataFrame (WGS84) and reproject to NZTM (EPSG:2193)
+gdf_pts_wgs84 = gpd.GeoDataFrame(
+    stations_pdf,
+    geometry=gpd.points_from_xy(stations_pdf["LONGITUDE"], stations_pdf["LATITUDE"]),
+    crs="EPSG:4326"
+)
+gdf_pts_2193 = gdf_pts_wgs84.to_crs(2193)
+
+# 3.2 NZ polygon (Natural Earth) -> 2193
+world = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres"))
+nz_poly_2193 = world[world["name"] == "New Zealand"].to_crs(2193)
+nz_envelope = nz_poly_2193.unary_union  # for voronoi envelope & later clipping
+
+# 3.3 Voronoi tessellation on NZ envelope
+#     注意：shapely>=2.0 的 voronoi_diagram 输入是 MultiPoint 或 GeometryCollection
+vor = voronoi_diagram(gdf_pts_2193.unary_union, envelope=nz_envelope)
+# 转为 GeoDataFrame，并与最近点配对（每一个 Voronoi cell 关联到一个站点）
+vor_gdf = gpd.GeoDataFrame(geometry=list(vor.geoms), crs=2193)
+
+# 将 Voronoi 多边形裁剪到 NZ 国界
+vor_clip = gpd.overlay(vor_gdf, nz_poly_2193, how="intersection")
+
+# 用最近邻把 Voronoi cell 绑定到站点（每个 cell 对应一个最近站）
+cell_to_station = vor_clip.sjoin_nearest(gdf_pts_2193[["ID", "geometry"]], how="left")
+cell_to_station = cell_to_station.rename(columns={"ID": "ID"})
+
+# 3.4 计算面积权重（按站聚合：有些站可能分得多个小片）
+cell_to_station["area"] = cell_to_station.geometry.area
+weights_df = (cell_to_station
+              .groupby("ID", as_index=False)["area"].sum()
+              .rename(columns={"area": "area_total"}))
+
+# 归一化权重 w_i
+weights_df["w"] = weights_df["area_total"] / weights_df["area_total"].sum()
+
+# ========= 4) MERGE WEIGHTS WITH STATION-MONTH TABLE =========
+aligned = monthly_station.merge(weights_df[["ID", "w"]], on="ID", how="left")
+
+# ========= 5) TIME-STRATIFIED, AVAILABILITY-RENORMALIZED MEAN =========
+def weighted_mean_in_month(g, col):
+    """g: rows of one month; col: 'TMIN_avg' or 'TMAX_avg'
+    在当月有效站点中按 Voronoi 权重重标化后求加权均值"""
+    g_valid = g[g["is_valid"] & g[col].notna() & g["w"].notna()]
+    if g_valid.empty:
+        return np.nan, 0
+    w_norm = g_valid["w"] / g_valid["w"].sum()
+    val = np.sum(w_norm * g_valid[col].to_numpy())
+    return val, len(g_valid)
+
+rows = []
+for month, g in aligned.groupby("month_start"):
+    tmin_val, n_tmin = weighted_mean_in_month(g, "TMIN_avg")
+    tmax_val, n_tmax = weighted_mean_in_month(g, "TMAX_avg")
+    rows.append({
+        "month_start": month,
+        "TMIN_nzavg": tmin_val,
+        "TMAX_nzavg": tmax_val,
+        "n_used_TMIN": n_tmin,
+        "n_used_TMAX": n_tmax
+    })
+
+nz_monthly_avg = pd.DataFrame(rows).sort_values("month_start").reset_index(drop=True)
+
+# ========= 6) （可选）绘图 =========
+import matplotlib.pyplot as plt
+fig, ax = plt.subplots(figsize=(14, 6))
+ax.plot(nz_monthly_avg["month_start"], nz_monthly_avg["TMIN_nzavg"], label="TMIN_nzavg")
+ax.plot(nz_monthly_avg["month_start"], nz_monthly_avg["TMAX_nzavg"], label="TMAX_nzavg")
+ax.set_title("NZ Area-Weighted National Monthly Mean (time-stratified, Voronoi weights)")
+ax.set_ylabel("°C")
+ax.legend()
+fig.autofmt_xdate()
+plt.show()
+
+# 结果表：nz_monthly_avg  ->  [month_start, TMIN_nzavg, TMAX_nzavg, n_used_TMIN, n_used_TMAX]
