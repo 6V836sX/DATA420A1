@@ -1,0 +1,12 @@
+pyear_avg = (
+    daily_nz_tmin_tmax
+    .select("ID", "DATE", "ELEMENT", "VALUE")
+    .withColumn("year", F.year("DATE"))
+    .groupBy("ID", "year")
+    .pivot("ELEMENT", ["TMIN", "TMAX"])
+    .agg(F.avg("VALUE"))
+    .withColumnRenamed("TMIN", "TMIN_avg")
+    .withColumnRenamed("TMAX", "TMAX_avg")
+)
+
+pyear_avg.show(10, truncate=False)
