@@ -1,87 +1,104 @@
-# ============================================================
-# Global PRCP stations → country counts (choropleth)
-# Robust Spark→pandas conversion + spatial join (no FIPS mapping)
-# ============================================================
+# ============================================
+# Bubble map: PRCP stations per country
+# (Spark aggregates → 218 rows → Pandas → plot)
+# ============================================
 
-import os
+import math
 import pandas as pd
 import geopandas as gpd
 import matplotlib.pyplot as plt
+from pyspark.sql import functions as F
 
-# ---------- 0) Spark to Pandas: robust loader ----------
-spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
-
-slim = (
+# 1) Spark：国家级聚合（每站只计一次，计算数量与国家“代表点”）
+country_agg = (
     prcp_stations
     .select("ID", "COUNTRY_CODE", "LATITUDE", "LONGITUDE")
     .dropna()
-    # 保险起见，去掉越界经纬度
     .filter((F.col("LATITUDE").between(-90, 90)) & (F.col("LONGITUDE").between(-180, 180)))
+    .dropDuplicates(["ID"])  # 避免同一站多次计入
+    .groupBy("COUNTRY_CODE")
+    .agg(
+        F.count("*").alias("station_count"),
+        F.avg("LATITUDE").alias("avg_lat"),
+        F.avg("LONGITUDE").alias("avg_lon"),
+    )
 )
 
-def spark_to_pandas_robust(df, tmp_dir="/tmp/prcp_pts_tmp"):
-    """Try Arrow .toPandas(); on failure, write Parquet and read via pandas."""
-    try:
-        return df.toPandas()
-    except Exception as e:
-        print("[Warn] toPandas failed, fallback to Parquet → pandas. Reason:", repr(e))
-        # 写到本地 Parquet（单分片，避免读多个文件）
-        df.coalesce(1).write.mode("overwrite").parquet(tmp_dir)
-        # 找到真正的数据文件（part-*.parquet）
-        part_files = [f for f in os.listdir(tmp_dir) if f.endswith(".parquet")]
-        assert part_files, f"No parquet part found under {tmp_dir}"
-        pq_path = os.path.join(tmp_dir, part_files[0])
-        return pd.read_parquet(pq_path)
+# 2) 收集到 Pandas（只有 ~218 行）
+bubble_df = country_agg.toPandas()
 
-pts_pdf = spark_to_pandas_robust(slim)
-
-# ---------- 1) GeoDataFrames ----------
-gdf_pts = gpd.GeoDataFrame(
-    pts_pdf,
-    geometry=gpd.points_from_xy(pts_pdf["LONGITUDE"], pts_pdf["LATITUDE"]),
-    crs="EPSG:4326"   # WGS84
-)
-
+# 3) 世界底图（WGS84）
 world = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres")).to_crs(4326)
-world = world[~world["iso_a3"].isin(["-99"])][["iso_a3", "name", "geometry"]]
 
-# ---------- 2) Spatial join: point-in-country ----------
-# 需要 rtree 或 shapely>=2 的空间索引以加速
-pts_with_country = gpd.sjoin(gdf_pts, world, how="left", predicate="within")
-
-# ---------- 3) Count by country & merge back ----------
-counts = (pts_with_country
-          .groupby(["iso_a3", "name"], dropna=False)
-          .size()
-          .reset_index(name="station_count"))
-
-world_counts = world.merge(counts, on=["iso_a3", "name"], how="left")
-world_counts["station_count"] = world_counts["station_count"].fillna(0).astype(int)
-
-# ---------- 4) Choropleth ----------
-fig, ax = plt.subplots(figsize=(16, 8))
-world_counts.plot(
-    ax=ax,
-    column="station_count",
-    cmap="viridis",
-    scheme="quantiles",  # 分位数分级，颜色分布更均匀
-    k=7,
-    edgecolor="#d9d9d9",
-    linewidth=0.4,
-    legend=True,
-    legend_kwds={"label": "Number of PRCP Stations (by country)", "loc": "lower left"},
+# 4) 把国家代表点做成 GeoDataFrame（WGS84）
+bubbles = gpd.GeoDataFrame(
+    bubble_df,
+    geometry=gpd.points_from_xy(bubble_df["avg_lon"], bubble_df["avg_lat"]),
+    crs="EPSG:4326"
 )
+
+# 5) 可选：投影到 Robinson（观感更好）；失败则保持 4326
+target_crs = "ESRI:54030"
+try:
+    world_proj = world.to_crs(target_crs)
+    bubbles_proj = bubbles.to_crs(target_crs)
+except Exception:
+    target_crs = "EPSG:4326"
+    world_proj = world
+    bubbles_proj = bubbles
+
+# 6) 气泡大小（按平方根缩放，保证视觉面积接近线性）
+c = bubbles_proj["station_count"].astype(float)
+c_min, c_max = float(c.min()), float(c.max())
+# 你可以调 min/max_size 来控制视觉效果
+min_size, max_size = 10, 800  # matplotlib scatter 的 s 是面积像素
+if c_max > 0:
+    s = min_size + (max_size - min_size) * (c.pow(0.5) - math.sqrt(max(1.0, c_min))) / (math.sqrt(c_max) - math.sqrt(max(1.0, c_min)))
+    s = s.clip(lower=min_size)
+else:
+    s = pd.Series([min_size] * len(c))
+
+# 7) 绘图
+fig, ax = plt.subplots(figsize=(16, 8))
+world_proj.plot(ax=ax, color="#eef2f6", edgecolor="#c9d1da", linewidth=0.5, zorder=0)
+
+# 国家代表点（按站点数大小）
+bubbles_proj.plot(
+    ax=ax,
+    markersize=s,     # 比例符号
+    alpha=0.65,
+    color="#1f77b4",
+    edgecolor="white",
+    linewidth=0.3,
+    zorder=2,
+)
+
 ax.set_axis_off()
 ax.set_title(
-    "Global Distribution of Precipitation Stations by Country\n"
-    "(spatial join on Natural Earth; CRS=EPSG:4326)",
+    f"Global PRCP Stations by Country (bubble size ∝ station count)\nCRS: {target_crs}",
     fontsize=13
 )
+
+# 8) 自定义气泡图例（示例取 3 个刻度）
+for legend_val in [100, 1000, int(c_max)]:
+    if legend_val <= 0 or legend_val > c_max:
+        continue
+    # 复用同样的缩放函数计算对应面积
+    area = min_size + (max_size - min_size) * (math.sqrt(legend_val) - math.sqrt(max(1.0, c_min))) / (math.sqrt(c_max) - math.sqrt(max(1.0, c_min)))
+    plt.scatter([], [], s=area, color="#1f77b4", alpha=0.65, edgecolors="white", linewidths=0.3,
+                label=f"{legend_val:,}")
+
+leg = ax.legend(
+    scatterpoints=1, frameon=True, labelspacing=1.2, title="Stations",
+    loc="lower left", bbox_to_anchor=(0.02, 0.02)
+)
+leg.get_title().set_fontsize(10)
+
 plt.tight_layout()
-plt.savefig("./supplementary/global_prcp_stations_choropleth.png", dpi=220, bbox_inches="tight")
+plt.savefig("./supplementary/global_prcp_stations_bubble.png", dpi=220, bbox_inches="tight")
 plt.show()
 
-# ---------- 5) Export table ----------
-out_csv = "./supplementary/prcp_station_counts_by_country.csv"
-world_counts[["iso_a3", "name", "station_count"]].to_csv(out_csv, index=False)
+# 9) 导出聚合表
+out_csv = "./supplementary/prcp_station_country_bubbles.csv"
+bubbles[["COUNTRY_CODE", "station_count", "avg_lat", "avg_lon"]].to_csv(out_csv, index=False)
 print("Saved:", out_csv)
