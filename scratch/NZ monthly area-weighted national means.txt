@@ -1,36 +1,93 @@
 # --------------------------------------------
 # NZ monthly area-weighted national means for TMIN / TMAX
-# Time stratification (by month) + Voronoi area weights + availability renormalization
+# Time stratification (by month) + Voronoi area weights + availability re-normalization
+# --------------------------------------------
+#
+# Algorithm overview & design considerations
+# --------------------------------------------
+# Goal:
+#   Estimate New Zealand’s national monthly means for TMIN and TMAX using
+#   (1) time stratification (aggregate by month),
+#   (2) spatial weights from a Voronoi tessellation over station locations, and
+#   (3) per-month availability re-normalization so that months with missing stations
+#       are not biased toward the subset that happened to report.
+#
+# Inputs:
+#   - daily_nz_tmin_tmax (Spark DataFrame): columns ID, DATE (yyyy-mm-dd), ELEMENT in {TMIN,TMAX}, VALUE
+#   - nz_station_loc     (Spark DataFrame): columns ID, LATITUDE, LONGITUDE (WGS84)
+#
+# Steps:
+#   1) Pivot daily data to wide (TMIN/TMAX columns), then convert to pandas and add a month_start key.
+#   2) For each station-month, compute daily-count QC and the monthly averages of TMIN/TMAX.
+#      A station-month is considered valid if days_present >= MIN_DAYS_PER_MONTH.
+#   3) Build spatial weights once, independent of time:
+#        - Project station points to NZTM (EPSG:2193).
+#        - Extract the New Zealand polygon from Natural Earth and project to EPSG:2193.
+#        - Build a Voronoi tessellation with the NZ polygon as the envelope.
+#        - Clip Voronoi cells to the NZ polygon.
+#        - Map each cell to its nearest station; sum cell areas per station to get area weights.
+#        - Normalize areas to sum to 1 to get w_i.
+#   4) Merge the weights into the station-month table.
+#   5) For each month, compute an availability re-normalized weighted mean:
+#        - Filter to valid station-months having both a value and weight.
+#        - Re-normalize the weights within that month so the subset of available stations sums to 1.
+#        - Compute the weighted average for TMIN and TMAX separately.
+#        - Record how many stations contributed in that month (n_used_*).
+#
+# Why Voronoi weights?
+#   Voronoi area approximates each station’s “zone of influence” given only point locations,
+#   offering a simple, reproducible spatial weighting when gridded climatologies are unavailable.
+#
+# CRS & geometry notes:
+#   - Areas are computed in EPSG:2193 (metres), so weights are physically meaningful.
+#   - We use Natural Earth’s New Zealand polygon as the clipping boundary. For production,
+#     replace with a higher-resolution NZ boundary if desired.
+#
+# QC & robustness:
+#   - MIN_DAYS_PER_MONTH guards against months with too few reports at a station.
+#   - The availability re-normalization removes bias when some stations are missing in a month.
+#   - If no valid stations exist in a month, the result is NaN.
+#
+# Caveats:
+#   - Voronoi-based areal weighting assumes spatial representativeness of stations; complex terrain,
+#     microclimates, and coastal effects are not explicitly modeled.
+#   - Using Natural Earth boundaries may slightly mis-estimate coastal areas; swap in a better coastline if needed.
+#   - If stations move or IDs represent changing locations, re-compute weights per epoch or resolve metadata first.
+#
+# Output:
+#   - nz_monthly_avg (pandas DataFrame):
+#       [month_start, TMIN_nzavg, TMAX_nzavg, n_used_TMIN, n_used_TMAX]
+#   - A PNG figure saved to ./supplementary/National_monthly_TM_avg.png
 # --------------------------------------------
 
 from shapely.ops import voronoi_diagram
 
-
-daily_nz_tm_wide = (
-    daily_nz_tmin_tmax
-    .groupBy("ID","DATE")
-    .pivot("ELEMENT",["TMIN","TMAX"])
-    .agg(F.first("VALUE"))
-)
 # ========= 0) PARAMETERS =========
-# 月度有效性的日数阈值（例如：一个月至少20天有观测才认为该月有效）
+# Monthly validity threshold: a station-month is valid if it has at least this many daily observations
 MIN_DAYS_PER_MONTH = 20
 
 # ========= 1) LOAD / PREPARE TABULAR DATA =========
-# daily_nz_tmin_tmax: Spark DataFrame with columns: ID, DATE (yyyy-mm-dd), TMIN, TMAX
-# nz_station_loc: Spark DataFrame with columns: ID, LATITUDE, LONGITUDE
+# daily_nz_tmin_tmax: Spark DataFrame with columns: ID, DATE (yyyy-mm-dd), ELEMENT in {TMIN,TMAX}, VALUE
+# nz_station_loc:     Spark DataFrame with columns: ID, LATITUDE, LONGITUDE
+daily_nz_tm_wide = (
+    daily_nz_tmin_tmax
+    .groupBy("ID", "DATE")
+    .pivot("ELEMENT", ["TMIN", "TMAX"])
+    .agg(F.first("VALUE"))
+)
 
-# to pandas
+# Convert to pandas
 daily_pdf = daily_nz_tm_wide.select("ID", "DATE", "TMIN", "TMAX").toPandas().copy()
 stations_pdf = nz_station_loc.select("ID", "LATITUDE", "LONGITUDE").toPandas().copy()
 
-# parse dates & make month_start
+# Parse dates & make month_start (month floor)
 daily_pdf["DATE"] = pd.to_datetime(daily_pdf["DATE"])
-daily_pdf["month_start"] = daily_pdf["DATE"].values.astype("datetime64[M]")  # month floor
+daily_pdf["month_start"] = daily_pdf["DATE"].values.astype("datetime64[M]")
 
 # ========= 2) STATION-MONTH AGGREGATION + QC =========
-# per-station per-month: mean TMIN/TMAX + #days present
-monthly_station = (daily_pdf
+# Per-station per-month: mean TMIN/TMAX + number of distinct days present
+monthly_station = (
+    daily_pdf
     .groupby(["ID", "month_start"], as_index=False)
     .agg(TMIN_avg=("TMIN", "mean"),
          TMAX_avg=("TMAX", "mean"),
@@ -39,7 +96,7 @@ monthly_station = (daily_pdf
 monthly_station["is_valid"] = monthly_station["days_present"] >= MIN_DAYS_PER_MONTH
 
 # ========= 3) VORONOI AREA WEIGHTS (SPATIAL) =========
-# 3.1 stations -> GeoDataFrame (WGS84) and reproject to NZTM (EPSG:2193)
+# 3.1 Stations → GeoDataFrame (WGS84) and reproject to NZTM (EPSG:2193)
 gdf_pts_wgs84 = gpd.GeoDataFrame(
     stations_pdf,
     geometry=gpd.points_from_xy(stations_pdf["LONGITUDE"], stations_pdf["LATITUDE"]),
@@ -47,41 +104,49 @@ gdf_pts_wgs84 = gpd.GeoDataFrame(
 )
 gdf_pts_2193 = gdf_pts_wgs84.to_crs(2193)
 
-# 3.2 NZ polygon (Natural Earth) -> 2193
+# 3.2 New Zealand polygon (Natural Earth) → EPSG:2193
 world = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres"))
 nz_poly_2193 = world[world["name"] == "New Zealand"].to_crs(2193)
-nz_envelope = nz_poly_2193.unary_union  # for voronoi envelope & later clipping
+nz_envelope = nz_poly_2193.unary_union  # used as Voronoi envelope and for clipping
 
-# 3.3 Voronoi tessellation on NZ envelope
-#     注意：shapely>=2.0 的 voronoi_diagram 输入是 MultiPoint 或 GeometryCollection
+# 3.3 Voronoi tessellation on the NZ envelope
+#     Note: shapely>=2.0 voronoi_diagram expects a MultiPoint / GeometryCollection
 vor = voronoi_diagram(gdf_pts_2193.unary_union, envelope=nz_envelope)
-# 转为 GeoDataFrame，并与最近点配对（每一个 Voronoi cell 关联到一个站点）
+
+# Convert to GeoDataFrame and associate each cell with its nearest station
 vor_gdf = gpd.GeoDataFrame(geometry=list(vor.geoms), crs=2193)
 
-# 将 Voronoi 多边形裁剪到 NZ 国界
+# Clip Voronoi cells to NZ boundary
 vor_clip = gpd.overlay(vor_gdf, nz_poly_2193, how="intersection")
 
-# 用最近邻把 Voronoi cell 绑定到站点（每个 cell 对应一个最近站）
+# Join each cell to the nearest station (each cell corresponds to one nearest station)
+# Requires a spatial index (pygeos or rtree) to be installed for performance.
 cell_to_station = vor_clip.sjoin_nearest(gdf_pts_2193[["ID", "geometry"]], how="left")
 cell_to_station = cell_to_station.rename(columns={"ID": "ID"})
 
-# 3.4 计算面积权重（按站聚合：有些站可能分得多个小片）
+# 3.4 Compute area weights (aggregate: a station can own multiple clipped fragments)
 cell_to_station["area"] = cell_to_station.geometry.area
-weights_df = (cell_to_station
-              .groupby("ID", as_index=False)["area"].sum()
-              .rename(columns={"area": "area_total"}))
+weights_df = (
+    cell_to_station
+    .groupby("ID", as_index=False)["area"]
+    .sum()
+    .rename(columns={"area": "area_total"})
+)
 
-# 归一化权重 w_i
+# Normalize to get per-station weights w_i (sum to 1 over all stations)
 weights_df["w"] = weights_df["area_total"] / weights_df["area_total"].sum()
-
 
 # ========= 4) MERGE WEIGHTS WITH STATION-MONTH TABLE =========
 aligned = monthly_station.merge(weights_df[["ID", "w"]], on="ID", how="left")
 
-# ========= 5) TIME-STRATIFIED, AVAILABILITY-RENORMALIZED MEAN =========
+# ========= 5) TIME-STRATIFIED, AVAILABILITY RE-NORMALIZED MEAN =========
 def weighted_mean_in_month(g, col):
-    """g: rows of one month; col: 'TMIN_avg' or 'TMAX_avg'
-    在当月有效站点中按 Voronoi 权重重标化后求加权均值"""
+    """
+    Compute the re-normalized Voronoi-weighted mean for a single month.
+    g: rows for one month
+    col: 'TMIN_avg' or 'TMAX_avg'
+    Returns (value, n_used) where n_used is the number of contributing stations.
+    """
     g_valid = g[g["is_valid"] & g[col].notna() & g["w"].notna()]
     if g_valid.empty:
         return np.nan, 0
@@ -101,10 +166,15 @@ for month, g in aligned.groupby("month_start"):
         "n_used_TMAX": n_tmax
     })
 
-nz_monthly_avg = pd.DataFrame(rows).sort_values("month_start").reset_index(drop=True)
+nz_monthly_avg = (
+    pd.DataFrame(rows)
+    .sort_values("month_start")
+    .reset_index(drop=True)
+)
 
-# ========= 6) （可选）绘图 =========
+# ========= 6) OPTIONAL: PLOT =========
 import matplotlib.pyplot as plt
+
 fig, ax = plt.subplots(figsize=(14, 6))
 ax.plot(nz_monthly_avg["month_start"], nz_monthly_avg["TMIN_nzavg"], label="TMIN_nzavg")
 ax.plot(nz_monthly_avg["month_start"], nz_monthly_avg["TMAX_nzavg"], label="TMAX_nzavg")
@@ -112,7 +182,11 @@ ax.set_title("NZ Area-Weighted National Monthly Mean (time-stratified, Voronoi w
 ax.set_ylabel("°C")
 ax.legend()
 fig.autofmt_xdate()
-plt.savefig("./supplementary/National_monthly_TM_avg.png")
+
+# Save a copy (adjust path as needed)
+plt.savefig("./supplementary/National_monthly_TM_avg.png", dpi=200, bbox_inches="tight")
 plt.show()
 
-# 结果表：nz_monthly_avg  ->  [month_start, TMIN_nzavg, TMAX_nzavg, n_used_TMIN, n_used_TMAX]
+# Final table:
+#   nz_monthly_avg → columns:
+#     [month_start, TMIN_nzavg, TMAX_nzavg, n_used_TMIN, n_used_TMAX]
