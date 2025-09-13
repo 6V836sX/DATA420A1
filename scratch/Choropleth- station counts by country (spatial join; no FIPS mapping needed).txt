@@ -1,0 +1,65 @@
+# === Choropleth: station counts by country (spatial join; no FIPS mapping needed) ===
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# 1) Spark → pandas（只取需要的列）
+pts_pdf = (prcp_stations
+           .select("ID", "COUNTRY_CODE", "LATITUDE", "LONGITUDE")
+           .dropna()
+           .toPandas())
+
+# 2) 点 → GeoDataFrame（WGS84）
+gdf_pts = gpd.GeoDataFrame(
+    pts_pdf,
+    geometry=gpd.points_from_xy(pts_pdf["LONGITUDE"], pts_pdf["LATITUDE"]),
+    crs="EPSG:4326"
+)
+
+# 3) 世界底图（同样保持 WGS84，便于空间连接）
+world = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres")).to_crs(4326)
+world = world[~world["iso_a3"].isin(["-99"])]   # 去掉无效记录
+
+# 4) 空间连接：给每个站点匹配其所属国家多边形
+#    需要安装 rtree 或 pygeos/shapely>=2 的空间索引以加速
+pts_with_country = gpd.sjoin(gdf_pts, world[["iso_a3", "name", "geometry"]],
+                             how="left", predicate="within")
+
+# 5) 按国家统计站点数（使用 Natural Earth 的 iso_a3/name）
+counts = (pts_with_country
+          .groupby(["iso_a3", "name"], dropna=False)
+          .size()
+          .reset_index(name="station_count"))
+
+# 6) 合并回世界多边形，缺失填 0（例如远海小岛或匹配失败的点）
+world_counts = world.merge(counts, on=["iso_a3", "name"], how="left")
+world_counts["station_count"] = world_counts["station_count"].fillna(0).astype(int)
+
+# 7) 绘图（分位数分级更均衡；或换成 natural breaks）
+fig, ax = plt.subplots(figsize=(16, 8))
+world_counts.plot(
+    ax=ax,
+    column="station_count",
+    cmap="viridis",
+    scheme="quantiles",   # 分位数分级，让颜色分布更均衡
+    k=7,                  # 分 7 档
+    edgecolor="#d9d9d9",
+    linewidth=0.4,
+    legend=True,
+    legend_kwds={"label": "Number of PRCP Stations (by country)", "loc": "lower left"}
+)
+ax.set_axis_off()
+ax.set_title(
+    "Global Distribution of Precipitation Stations by Country\n"
+    "(spatial join on Natural Earth; CRS=EPSG:4326)",
+    fontsize=13
+)
+plt.tight_layout()
+plt.savefig("./supplementary/global_prcp_stations_choropleth.png", dpi=220, bbox_inches="tight")
+plt.show()
+
+# Optional：导出国家计数表
+(out_path := "./supplementary/prcp_station_counts_by_country.csv")
+world_counts[["iso_a3", "name", "station_count"]].to_csv(out_path, index=False)
+print("Saved:", out_path)
