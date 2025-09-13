@@ -1,0 +1,36 @@
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+
+# Assume you already have a DataFrame "annual_pdf"
+# with a column "annual_avg_prcp" for global annual average rainfall
+data = annual_pdf["annual_avg_prcp"].dropna()
+
+# Threshold for clipping (99th percentile)
+clip_threshold = np.percentile(data, 99)
+
+# Create figure with 2 subplots (stacked vertically)
+fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+
+# --- (A) Boxplot with clipping (focus on bulk distribution) ---
+sns.boxplot(
+    x=data[data < clip_threshold],
+    ax=axes[0],
+    color="skyblue",
+    fliersize=2
+)
+axes[0].set_title("Distribution of Annual Average Rainfall (<99th Percentile)")
+axes[0].set_xlabel("Average Rainfall")
+
+# --- (B) Boxplot with log scale (full data, outliers compressed) ---
+sns.boxplot(
+    x=np.log1p(data),  # log(1+x) transform
+    ax=axes[1],
+    color="lightgreen",
+    fliersize=2
+)
+axes[1].set_title("Distribution of Annual Average Rainfall (Log Scale)")
+axes[1].set_xlabel("log(1 + Average Rainfall)")
+
+plt.tight_layout()
+plt.show()
