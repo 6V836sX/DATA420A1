@@ -1,0 +1,20 @@
+# Generate requirements.txt for currently imported modules
+import pkg_resources, sys
+
+# Collect loaded modules that are from site-packages (exclude builtins/stdlib)
+loaded_packages = {}
+for name, module in sys.modules.items():
+    if module and hasattr(module, "__file__") and "site-packages" in module.__file__:
+        pkg_name = name.split(".")[0]
+        try:
+            dist = pkg_resources.get_distribution(pkg_name)
+            loaded_packages[dist.project_name] = dist.version
+        except pkg_resources.DistributionNotFound:
+            continue
+
+# Write to requirements.txt
+with open("requirements.txt", "w") as f:
+    for pkg, ver in sorted(loaded_packages.items()):
+        f.write(f"{pkg}=={ver}\n")
+
+print("✓ requirements.txt has been generated")
