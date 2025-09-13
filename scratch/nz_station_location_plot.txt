@@ -29,26 +29,45 @@ world = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres"))
 nz_poly = world[world["name"] == "New Zealand"].to_crs(2193)
 
 # === 5) Plot with colormap ===
-fig, ax = plt.subplots(figsize=(8, 8))
+fig, ax = plt.subplots(figsize=(8, 10))
 
-# Draw NZ polygon
-nz_poly.plot(ax=ax, edgecolor="black", linewidth=0.6, alpha=0.15)
-
-# Plot stations with color based on missing_month_total
+# Plot main map
 gdf_pts_nztm.plot(
     ax=ax,
-    column="missing_month_total",   # color by missing data
-    cmap="Reds",                    # red colormap (light=low, dark=high)
+    column="missing_month_total",
+    cmap="Reds",
     markersize=80,
-    legend=True
+    legend=False   # disable default legend
 )
 
-# Add optional labels
+# Add station labels
 for _, r in gdf_pts_nztm.iterrows():
-    ax.annotate(r["ID"], xy=(r.geometry.x, r.geometry.y),
-                xytext=(3, 3), textcoords="offset points", fontsize=7)
+    ax.annotate(
+        r["ID"],
+        xy=(r.geometry.x, r.geometry.y),
+        xytext=(3, 3),
+        textcoords="offset points",
+        fontsize=6
+    )
 
-ax.set_title("NZ Weather Stations: Missing Months (darker = more missing)", fontsize=12)
+# ==== Create a separate colorbar axis ====
+# [left, bottom, width, height] relative to the whole figure
+cax = fig.add_axes([0.92, 0.15, 0.02, 0.7])  
+# 0.92 = horizontal position (closer to right), 0.02 = width of the colorbar
+
+sm = plt.cm.ScalarMappable(
+    cmap="Reds",
+    norm=plt.Normalize(
+        vmin=gdf_pts_nztm["missing_month_total"].min(),
+        vmax=gdf_pts_nztm["missing_month_total"].max()
+    )
+)
+sm._A = []  # required for older Matplotlib versions
+
+cbar = fig.colorbar(sm, cax=cax)  
+cbar.set_label("Missing Months (darker = more missing)", fontsize=10)
+
+ax.set_title("NZ Weather Stations: Missing Months", fontsize=12)
 ax.set_axis_off()
-plt.tight_layout()
+
 plt.show()
