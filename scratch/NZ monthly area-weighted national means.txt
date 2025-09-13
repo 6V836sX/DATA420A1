@@ -190,3 +190,34 @@ plt.show()
 # Final table:
 #   nz_monthly_avg → columns:
 #     [month_start, TMIN_nzavg, TMAX_nzavg, n_used_TMIN, n_used_TMAX]
+
+
+
+# ========= 7) AGGREGATE TO ANNUAL MEANS =========
+# Add year column
+nz_monthly_avg["year"] = nz_monthly_avg["month_start"].dt.year
+
+# For each year, compute mean TMIN/TMAX across valid months
+nz_annual_avg = (
+    nz_monthly_avg
+    .groupby("year", as_index=False)
+    .agg(TMIN_nzavg=("TMIN_nzavg", "mean"),
+         TMAX_nzavg=("TMAX_nzavg", "mean"),
+         n_used_TMIN=("n_used_TMIN", "sum"),
+         n_used_TMAX=("n_used_TMAX", "sum"))
+)
+
+# ========= 8) PLOT ANNUAL MEANS =========
+fig, ax = plt.subplots(figsize=(12, 5))
+ax.plot(nz_annual_avg["year"], nz_annual_avg["TMIN_nzavg"], marker="o", label="Annual TMIN_nzavg")
+ax.plot(nz_annual_avg["year"], nz_annual_avg["TMAX_nzavg"], marker="o", label="Annual TMAX_nzavg")
+ax.set_title("NZ Area-Weighted National Annual Mean (TMIN/TMAX)")
+ax.set_ylabel("°C")
+ax.set_xlabel("Year")
+ax.legend()
+plt.grid(True, linestyle="--", alpha=0.6)
+
+plt.savefig("./supplementary/National_annual_TM_avg.png", dpi=200, bbox_inches="tight")
+plt.show()
+
+# Final table: nz_annual_avg → [year, TMIN_nzavg, TMAX_nzavg, n_used_TMIN, n_used_TMAX]
