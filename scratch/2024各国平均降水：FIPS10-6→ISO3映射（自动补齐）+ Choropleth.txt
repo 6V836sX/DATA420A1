@@ -157,9 +157,30 @@ except Exception:
     world_plot = world_join
 
 # 绘图（无观测国家灰色）
-fig, ax = plt.subplots(figsize=(16, 8))
-world_plot.plot(
+# ========= Robinson projection choropleth with lat/lon grid (Cartopy) =========
+# Requires: cartopy >= 0.20, shapely >= 2.0  (install if missing)
+
+import numpy as np
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
+
+# 1) 准备投影：Robinson 显示，PlateCarree 为数据的经纬度参考
+proj_display = ccrs.Robinson()
+proj_geo = ccrs.PlateCarree()  # 数据坐标是经纬度（WGS84）
+
+# 2) GeoDataFrame 转回 WGS84（Cartopy 需要 transform=proj_geo）
+gdf_wgs84 = world_join.to_crs(4326)
+
+# 3) 启动画布（注意：subplot_kw 指定 projection）
+fig = plt.figure(figsize=(16, 8))
+ax = plt.axes(projection=proj_display)
+
+# 4) 绘制底图（No data 使用 missing_kwds）
+#    geopandas 0.13+ 支持在 cartopy 轴上绘制并指定 transform
+gdf_wgs84.plot(
     ax=ax,
+    transform=proj_geo,
     column="PRCP_2024_country_avg",
     cmap="YlGnBu",
     legend=True,
@@ -168,23 +189,49 @@ world_plot.plot(
     linewidth=0.4,
     missing_kwds={"color": "#f0f0f0", "edgecolor": "#d3d9df", "hatch": "///", "label": "No data"},
 )
-ax.set_axis_off()
+
+# 5) 只在左/下显示经纬度标注与网格
+gl = ax.gridlines(
+    crs=proj_geo,
+    draw_labels=True,
+    xlocs=np.arange(-180, 181, 30),
+    ylocs=np.arange(-60, 91, 15),
+    linestyle=":",
+    linewidth=0.6,
+    alpha=0.6,
+    color="k",
+)
+gl.top_labels = False
+gl.right_labels = False
+gl.xlabel_style = {"size": 9}
+gl.ylabel_style = {"size": 9}
+gl.xformatter = LONGITUDE_FORMATTER
+gl.yformatter = LATITUDE_FORMATTER
+
+# 6) 标题与范围
+ax.set_global()
 ax.set_title(
-    "Average Rainfall by Country (2024)\n"
-    f"CRS: {target_crs}  •  Grey hatched = No data",
-    fontsize=13
+    "Average Rainfall by Country (2024)\nCRS: ESRI:54030  •  Grey hatched = No data",
+    fontsize=13,
 )
 
-# 给“无数据”加图例项（有的版本会自动，有的需要手动补）
+# 7) 补“无数据”图例项（有的版本会自动添加，这里兜底）
 handles, labels = ax.get_legend_handles_labels()
 if "No data" not in labels:
-    from matplotlib.patches import Patch
-    handles.append(Patch(facecolor="#f0f0f0", edgecolor="#d3d9df", hatch="///", label="No data"))
+    import matplotlib.patches as mpatches
+    no_data_patch = mpatches.Patch(facecolor="#f0f0f0", edgecolor="#d3d9df", hatch="///", label="No data")
+    handles.append(no_data_patch)
     ax.legend(handles=handles, loc="lower left")
 
+# 8) 保存
+import os
+os.makedirs("./supplementary", exist_ok=True)
+out_png = "./supplementary/precip_2024_choropleth_robinson_axes.png"
 plt.tight_layout()
-plt.savefig("./supplementary/precip_2024_choropleth.png", dpi=220, bbox_inches="tight")
+plt.savefig(out_png, dpi=300, bbox_inches="tight")
 plt.show()
+
+print("Saved:", out_png)
 
 print("✓ Saved mapping to ./supplementary/fips_to_iso3_completed.csv")
 print("✓ Saved country table to ./supplementary/precip_2024_by_country.csv")
