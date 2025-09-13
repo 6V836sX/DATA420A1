@@ -1,0 +1,139 @@
+# === One-click installer for the CURRENT Jupyter kernel ===
+# Features:
+# 1) Print the Python path of the current Jupyter kernel (sys.executable)
+# 2) Check whether each package can be imported; if missing, install into the current interpreter
+# 3) If conda is available, try conda-forge first for geospatial-heavy packages; otherwise fallback to pip
+# 4) After installation, re-verify import automatically
+# 5) At the end, output a Git commit-style summary
+
+import sys, subprocess, importlib, shutil, textwrap, os
+
+# List of required packages (you can modify as needed)
+REQUIRED = [
+    "cartopy",          # Cartographic projections/maps
+    "geopandas",        # Vector geospatial data
+    "matplotlib",       # Plotting
+    "numpy", "pandas",  # Scientific computing / data processing
+    "pyproj", "shapely","fiona","pyogrio",  # geospatial dependencies
+    "pyspark"           # Spark
+]
+
+# Packages that are better installed via conda-forge if conda exists
+GEOSPATIAL_HEAVY = {"cartopy","geopandas","fiona","rasterio","pyproj","shapely","pyogrio"}
+
+PY = sys.executable
+HAS_CONDA = shutil.which("conda") is not None
+
+print("=== Kernel Python ===")
+print("sys.executable:", PY)
+print("sys.version   :", sys.version.splitlines()[0])
+print()
+
+def run(cmd, env=None):
+    """Run a shell command and stream its output into the notebook. Return exit code."""
+    print(">>", " ".join(cmd))
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    for line in p.stdout:
+        print(line, end="")
+    p.wait()
+    print()
+    return p.returncode
+
+def ensure_with_pip(pkg):
+    # Use the current kernel’s interpreter for installation (important!)
+    return run([PY, "-m", "pip", "install", "--user", pkg])
+
+def ensure_with_conda(pkg):
+    # -y = auto-confirm
+    return run(["conda", "install", "-y", "-c", "conda-forge", pkg])
+
+def is_installed(pkg):
+    try:
+        importlib.import_module(pkg)
+        return True
+    except Exception:
+        return False
+
+def get_version(pkg):
+    try:
+        mod = importlib.import_module(pkg)
+        return getattr(mod, "__version__", "unknown")
+    except Exception:
+        return None
+
+# Track changes
+installed_now = []
+already_ok = []
+failed = []
+
+def install_package(pkg):
+    print(f"--- Checking: {pkg} ---")
+    if is_installed(pkg):
+        already_ok.append(f"{pkg}=={get_version(pkg)}")
+        print(f"[OK] {pkg} already importable.\n")
+        return True
+
+    if HAS_CONDA and pkg in GEOSPATIAL_HEAVY:
+        print(f"[INFO] Using conda-forge to install {pkg} ...")
+        code = ensure_with_conda(pkg)
+        if code == 0 and is_installed(pkg):
+            ver = get_version(pkg)
+            installed_now.append(f"{pkg}=={ver}")
+            print(f"[OK] {pkg} installed via conda-forge.\n")
+            return True
+        else:
+            print(f"[WARN] conda install failed, falling back to pip ...")
+            code = ensure_with_pip(pkg)
+            if code == 0 and is_installed(pkg):
+                ver = get_version(pkg)
+                installed_now.append(f"{pkg}=={ver}")
+                print(f"[OK] {pkg} installed via pip.\n")
+                return True
+            else:
+                failed.append(pkg)
+                print(f"[FAIL] {pkg} not importable.\n")
+                return False
+    else:
+        print(f"[INFO] Using pip to install {pkg} into current kernel ...")
+        code = ensure_with_pip(pkg)
+        if code == 0 and is_installed(pkg):
+            ver = get_version(pkg)
+            installed_now.append(f"{pkg}=={ver}")
+            print(f"[OK] {pkg} installed via pip.\n")
+            return True
+        else:
+            failed.append(pkg)
+            print(f"[FAIL] {pkg} not importable.\n")
+            return False
+
+# Main loop
+for pkg in REQUIRED:
+    install_package(pkg)
+
+print("=== Summary ===")
+if failed:
+    print("Some packages are still missing:", ", ".join(failed))
+    if "cartopy" in failed:
+        print(textwrap.dedent("""
+        *Hint for cartopy*
+        - Requires GEOS/PROJ and other system libraries. If pip fails, strongly recommend installing via conda-forge:
+            conda install -c conda-forge cartopy proj geos shapely pyproj
+        - If the Kubernetes container is read-only, ask admin to pre-install into the base image.
+        """))
+else:
+    print("All required packages are available. ✅")
+
+# --- Git commit-style summary ---
+print("\n=== Git Commit Summary ===")
+lines = []
+if installed_now:
+    lines.append("feat(env): installed new packages\n  - " + "\n  - ".join(installed_now))
+if already_ok:
+    lines.append("chore(env): already satisfied\n  - " + "\n  - ".join(already_ok))
+if failed:
+    lines.append("fix(env): failed to install\n  - " + "\n  - ".join(failed))
+
+if lines:
+    print("\n".join(lines))
+else:
+    print("chore(env): no changes, everything already installed")
