@@ -1,3 +1,9 @@
+# get the first day in each month
+pdf["month_start"] = pd.to_datetime(
+    pdf["year"].astype(str) + "-" + pdf["month"].astype(str) + "-01",
+    errors="coerce" # if convertion fails, the time will be set to Nat(Not a time).
+)
+
 # Keep only the columns needed for plotting & optimize types
 pdf = pdf[["ID", "month_start", "TMIN_avg", "TMAX_avg"]]
 pdf["ID"] = pdf["ID"].astype("category")
