@@ -1,0 +1,123 @@
+# ===================== Data Prep (memory-safe) =====================
+import os
+import pandas as pd
+import geopandas as gpd
+from pyspark.sql import functions as F
+from pyspark.sql import DataFrame
+from pyspark import StorageLevel
+
+# Spark/Arrow tuning
+spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
+spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", "50000")  # smaller batches
+
+# --- helper: safe toPandas with parquet fallback ---
+def spark_to_pandas_robust(df: DataFrame, tmp_dir="/tmp/precip_tmp_parquet") -> pd.DataFrame:
+    try:
+        return df.toPandas()
+    except Exception as e:
+        print("[Warn] toPandas failed, fallback to Parquet -> pandas. Reason:", repr(e))
+        df.coalesce(1).write.mode("overwrite").parquet(tmp_dir)
+        # find part-*.parquet
+        part = [f for f in os.listdir(tmp_dir) if f.endswith(".parquet")]
+        assert part, f"No parquet part in {tmp_dir}"
+        return pd.read_parquet(os.path.join(tmp_dir, part[0]))
+
+# ---------- 0) Load/define mapping (keep your full dict here) ----------
+FIPS_TO_ISO3_BASE = { ... }  # your dictionary
+
+# ---------- 1) Spark aggregations (only required cols) ----------
+# Ensure DATE->year column already present in daily_prcp; otherwise add with year(F.col("DATE"))
+daily_slim = (
+    daily_prcp
+    .select("ID", "PRCP_VALUE", "year")
+    .filter(F.col("year") == 2024)
+)
+
+# Avg per station (persist to avoid recompute)
+prcp_2024 = (
+    daily_slim
+    .groupBy("ID")
+    .agg(F.avg("PRCP_VALUE").alias("PRCP_2024_station_avg"))
+).persist(StorageLevel.MEMORY_AND_DISK)
+
+# Station->country (distinct, tiny)
+station_country = (
+    prcp_stations
+    .select("ID", "COUNTRY_CODE")
+    .dropna()
+    .dropDuplicates(["ID"])
+)
+
+# Broadcast the small side to avoid big shuffle
+country_avg_2024 = (
+    prcp_2024.join(F.broadcast(station_country), on="ID", how="inner")
+    .groupBy("COUNTRY_CODE")
+    .agg(
+        F.avg("PRCP_2024_station_avg").alias("PRCP_2024_country_avg"),
+        F.countDistinct("ID").alias("n_stations_2024")
+    )
+)
+
+# --- sanity checks BEFORE pulling to driver ---
+print("Rows per station avg:", prcp_2024.count())
+print("Rows per country avg (should be ~218):", country_avg_2024.count())
+country_avg_2024.show(5, truncate=False)
+
+# If somehow exploded (≫ 300), abort early
+cnt = country_avg_2024.count()
+if cnt > 400:
+    raise RuntimeError(f"Country agg unexpectedly large ({cnt}). Check join keys/duplicates.")
+
+# Only now convert to pandas (≈218 rows)
+avg_pdf = spark_to_pandas_robust(country_avg_2024)
+
+# ---------- 2) Mapping FIPS->ISO3 ----------
+avg_pdf["iso_a3"] = avg_pdf["COUNTRY_CODE"].map(FIPS_TO_ISO3_BASE)
+
+# ---------- 3) Lightweight spatial completion (optional & bounded) ----------
+need_fill = avg_pdf[avg_pdf["iso_a3"].isna()]["COUNTRY_CODE"].unique().tolist()
+print("Unmapped FIPS codes:", need_fill)
+
+# Only attempt spatial completion if missing is small (e.g., <= 20)
+if len(need_fill) > 0 and len(need_fill) <= 20:
+    reps = (
+        prcp_stations
+        .select("COUNTRY_CODE", "LATITUDE", "LONGITUDE")
+        .where(F.col("COUNTRY_CODE").isin(need_fill))
+        .groupBy("COUNTRY_CODE")
+        .agg(F.avg("LATITUDE").alias("avg_lat"), F.avg("LONGITUDE").alias("avg_lon"))
+    )
+    reps_pdf = spark_to_pandas_robust(reps)
+
+    reps_gdf = gpd.GeoDataFrame(
+        reps_pdf,
+        geometry=gpd.points_from_xy(reps_pdf["avg_lon"], reps_pdf["avg_lat"]),
+        crs="EPSG:4326"
+    )
+    world = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres")).to_crs(4326)
+    world = world[~world["iso_a3"].isin(["-99"])][["iso_a3", "name", "geometry"]]
+    reps_joined = gpd.sjoin(reps_gdf, world, how="left", predicate="within")
+    filled_map = dict(zip(reps_joined["COUNTRY_CODE"], reps_joined["iso_a3"]))
+    FIPS_TO_ISO3_COMPLETED = {**FIPS_TO_ISO3_BASE, **filled_map}
+else:
+    # Skip spatial completion if many are missing; mark as NaN -> “No data” on map
+    FIPS_TO_ISO3_COMPLETED = FIPS_TO_ISO3_BASE.copy()
+    if len(need_fill) > 20:
+        print(f"[Info] Too many missing codes ({len(need_fill)}). Skip spatial completion for stability.")
+
+avg_pdf["iso_a3"] = avg_pdf["iso_a3"].fillna(avg_pdf["COUNTRY_CODE"].map(FIPS_TO_ISO3_COMPLETED))
+
+# ---------- 4) Save outputs ----------
+os.makedirs("./supplementary", exist_ok=True)
+pd.Series(FIPS_TO_ISO3_COMPLETED).rename("ISO3").to_csv(
+    "./supplementary/fips_to_iso3_completed.csv", header=True
+)
+
+avg_pdf[["iso_a3", "COUNTRY_CODE", "PRCP_2024_country_avg", "n_stations_2024"]] \
+    .to_csv("./supplementary/precip_2024_by_country.csv", index=False)
+
+print("✓ Saved mapping -> ./supplementary/fips_to_iso3_completed.csv")
+print("✓ Saved country table -> ./supplementary/precip_2024_by_country.csv")
+
+
+
