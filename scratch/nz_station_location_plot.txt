@@ -4,27 +4,28 @@ import matplotlib.pyplot as plt
 
 
 # ------------------------------------------------------------
-# 1) Station table（Spark→pandas）
+# 1) Station table (Spark → pandas)
 # ------------------------------------------------------------
 nz_pdf = (nz_station_loc
           .select("ID", "LATITUDE", "LONGITUDE")
           .toPandas())
 
 # ------------------------------------------------------------
-# 2) 统计各站点“独立日期”的观测数（去除 TMIN/TMAX 重复天）
-#    obs_count = count_distinct(DATE) per ID
+# 2) Count distinct observation days per station 
+#    (remove duplicated TMIN/TMAX records on the same day)
 # ------------------------------------------------------------
 obs_count_df = (daily_nz_tmin_tmax
                 .filter(F.col("ELEMENT").isin("TMIN", "TMAX"))
-                .select("ID", "DATE")          # 仅保留站点与日期
-                .distinct()                    # 去掉同一天的 TMIN/TMAX 重复
+                .select("ID", "DATE")          # keep only station and date
+                .distinct()                    # remove duplicate TMIN/TMAX for the same day
                 .groupBy("ID")
                 .agg(F.count("*").alias("obs_count")))
 
 obs_count_pdf = obs_count_df.toPandas()
 
 # ------------------------------------------------------------
-# 3) 合并 & 缺失处理（确保 15 个站都在；缺失设为 0 也要画出来）
+# 3) Merge with station table & fill missing values
+#    Ensure all 15 stations are included (fill NaN with 0)
 # ------------------------------------------------------------
 merged = pd.merge(nz_pdf, obs_count_pdf, on="ID", how="left")
 merged["obs_count"] = merged["obs_count"].fillna(0).astype(int)
@@ -38,7 +39,7 @@ if missing_ids:
     print("Missing station IDs in merged:", missing_ids)
 
 # ------------------------------------------------------------
-# 4) 构建 GeoDataFrame（WGS84→NZTM2000）
+# 4) Build GeoDataFrame (WGS84 → NZTM2000)
 # ------------------------------------------------------------
 gdf_pts = gpd.GeoDataFrame(
     merged,
@@ -47,25 +48,25 @@ gdf_pts = gpd.GeoDataFrame(
 )
 gdf_pts_nztm = gdf_pts.to_crs(2193)
 
-# 检查是否确实有 15 个点
+# Ensure all 15 stations are present
 assert len(gdf_pts_nztm) == 15, f"Expected 15 stations, got {len(gdf_pts_nztm)}"
 
 # ------------------------------------------------------------
-# 5) 加载新西兰底图（Natural Earth）→ NZTM2000
+# 5) Load New Zealand polygon (Natural Earth) → NZTM2000
 # ------------------------------------------------------------
 world = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres"))
 nz_poly = world[world["name"] == "New Zealand"].to_crs(2193)
 
 # ------------------------------------------------------------
-# 6) 绘图（更深色＝更多数据 → 使用 'Blues' 正向色带）
+# 6) Plotting (darker = more data → use 'Reds' colormap)
 # ------------------------------------------------------------
 fig, ax = plt.subplots(figsize=(8, 10))
 
-# 6a) 底图
+# 6a) Base map
 nz_poly.plot(ax=ax, facecolor="#dfe8f2", edgecolor="#9fb5c8",
              linewidth=0.8, zorder=0)
 
-# 6b) 点图（obs_count 着色；Blues：值越大颜色越深）
+# 6b) Station points (color by obs_count)
 vals = gdf_pts_nztm["obs_count"].to_numpy(dtype=float)
 vmin = float(np.nanmin(vals))
 vmax = float(np.nanmax(vals)) if np.nanmax(vals) > 0 else 1.0
@@ -73,7 +74,7 @@ vmax = float(np.nanmax(vals)) if np.nanmax(vals) > 0 else 1.0
 gdf_pts_nztm.plot(
     ax=ax,
     column="obs_count",
-    cmap="Reds",            # 深=多，浅=少
+    cmap="Reds",            # darker = more data
     markersize=80,
     linewidth=0.4,
     edgecolor="white",
@@ -82,7 +83,7 @@ gdf_pts_nztm.plot(
     zorder=1
 )
 
-# 6c) 标注站点ID
+# 6c) Station labels
 for _, r in gdf_pts_nztm.iterrows():
     if r.geometry is not None:
         ax.annotate(
@@ -94,7 +95,7 @@ for _, r in gdf_pts_nztm.iterrows():
             color="#404040"
         )
 
-# 6d) 视图范围 & 标题
+# 6d) Map extent & title
 minx, miny, maxx, maxy = nz_poly.total_bounds
 pad_x = (maxx - minx) * 0.5
 pad_y = (maxy - miny) * 0.5
@@ -107,7 +108,7 @@ ax.set_title(
     fontsize=12
 )
 
-# 6e) 独立色条（右侧）
+# 6e) Standalone colorbar (right side)
 cax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
 sm = plt.cm.ScalarMappable(cmap="Reds",
                            norm=plt.Normalize(vmin=vmin, vmax=vmax))
