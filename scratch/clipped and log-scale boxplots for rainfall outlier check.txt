@@ -2,9 +2,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 
-# Assume you already have a DataFrame "annual_pdf"
-# with a column "annual_avg_prcp" for global annual average rainfall
-data = annual_pdf["annual_avg_prcp"].dropna()
+# Use the PRCP_yavg column from prcp_pdf
+data = prcp_pdf["PRCP_yavg"].dropna()
 
 # Threshold for clipping (99th percentile)
 clip_threshold = np.percentile(data, 99)
