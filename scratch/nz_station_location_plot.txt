@@ -1,21 +1,47 @@
+# === Imports ===
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
+from pyspark.sql import functions as F
 
-# === 1) Convert Spark DataFrames to pandas ===
-# Station locations (ID, LATITUDE, LONGITUDE)
+# ------------------------------------------------------------
+# 1) Station table（Spark→pandas）
+# ------------------------------------------------------------
 nz_pdf = (nz_station_loc
           .select("ID", "LATITUDE", "LONGITUDE")
           .toPandas())
 
-# Missing stats (ID, missing_year_total, missing_month_total)
-missing_pdf = daily_nz_tmin_tmax_missing_stats.toPandas()
+# ------------------------------------------------------------
+# 2) 统计各站点“独立日期”的观测数（去除 TMIN/TMAX 重复天）
+#    obs_count = count_distinct(DATE) per ID
+# ------------------------------------------------------------
+obs_count_df = (daily_nz_tmin_tmax
+                .filter(F.col("ELEMENT").isin("TMIN", "TMAX"))
+                .select("ID", "DATE")          # 仅保留站点与日期
+                .distinct()                    # 去掉同一天的 TMIN/TMAX 重复
+                .groupBy("ID")
+                .agg(F.count("*").alias("obs_count")))
 
-# === 2) Merge by station ID ===
-merged = pd.merge(nz_pdf, missing_pdf, on="ID", how="left")
+obs_count_pdf = obs_count_df.toPandas()
 
-# === 3) Create GeoDataFrame (WGS84) and reproject to NZTM2000 ===
+# ------------------------------------------------------------
+# 3) 合并 & 缺失处理（确保 15 个站都在；缺失设为 0 也要画出来）
+# ------------------------------------------------------------
+merged = pd.merge(nz_pdf, obs_count_pdf, on="ID", how="left")
+merged["obs_count"] = merged["obs_count"].fillna(0).astype(int)
+
+print(f"Stations listed: {len(nz_pdf)}")
+print(f"Stations after merge: {len(merged)}")
+if merged["obs_count"].isna().any():
+    print("Warning: some stations still have NaN in obs_count.")
+missing_ids = set(nz_pdf["ID"]) - set(merged["ID"])
+if missing_ids:
+    print("Missing station IDs in merged:", missing_ids)
+
+# ------------------------------------------------------------
+# 4) 构建 GeoDataFrame（WGS84→NZTM2000）
+# ------------------------------------------------------------
 gdf_pts = gpd.GeoDataFrame(
     merged,
     geometry=gpd.points_from_xy(merged["LONGITUDE"], merged["LATITUDE"]),
@@ -23,38 +49,44 @@ gdf_pts = gpd.GeoDataFrame(
 )
 gdf_pts_nztm = gdf_pts.to_crs(2193)
 
-# === 4) Load New Zealand polygon (Natural Earth) and reproject ===
+# 检查是否确实有 15 个点
+assert len(gdf_pts_nztm) == 15, f"Expected 15 stations, got {len(gdf_pts_nztm)}"
+
+# ------------------------------------------------------------
+# 5) 加载新西兰底图（Natural Earth）→ NZTM2000
+# ------------------------------------------------------------
 world = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres"))
 nz_poly = world[world["name"] == "New Zealand"].to_crs(2193)
 
-# === 5) Figure and axes ===
+# ------------------------------------------------------------
+# 6) 绘图（更深色＝更多数据 → 使用 'Blues' 正向色带）
+# ------------------------------------------------------------
 fig, ax = plt.subplots(figsize=(8, 10))
 
-# ---- 5a) Draw base map (NZ polygon) ----
-nz_poly.plot(ax=ax, facecolor="#dfe8f2", edgecolor="#9fb5c8", linewidth=0.8, zorder=0)
+# 6a) 底图
+nz_poly.plot(ax=ax, facecolor="#dfe8f2", edgecolor="#9fb5c8",
+             linewidth=0.8, zorder=0)
 
-# ---- 5b) Draw station points colored by missing_month_total ----
-# Compute vmin/vmax ignoring NaNs to keep color scale stable
-vals = gdf_pts_nztm["missing_month_total"].to_numpy(dtype=float)
-vmin = np.nanmin(vals)
-vmax = np.nanmax(vals)
+# 6b) 点图（obs_count 着色；Blues：值越大颜色越深）
+vals = gdf_pts_nztm["obs_count"].to_numpy(dtype=float)
+vmin = float(np.nanmin(vals))
+vmax = float(np.nanmax(vals)) if np.nanmax(vals) > 0 else 1.0
 
 gdf_pts_nztm.plot(
     ax=ax,
-    column="missing_month_total",
-    cmap="Reds",
+    column="obs_count",
+    cmap="Blues",            # 深=多，浅=少
     markersize=80,
     linewidth=0.4,
     edgecolor="white",
-    legend=False,  # disable default legend; we will add a right-aligned colorbar
-    vmin=vmin,
-    vmax=vmax,
+    legend=False,
+    vmin=vmin, vmax=vmax,
     zorder=1
 )
 
-# ---- 5c) Station labels ----
+# 6c) 标注站点ID
 for _, r in gdf_pts_nztm.iterrows():
-    if r.geometry is not None and not pd.isna(r.geometry.x):
+    if r.geometry is not None:
         ax.annotate(
             r["ID"],
             xy=(r.geometry.x, r.geometry.y),
@@ -64,30 +96,25 @@ for _, r in gdf_pts_nztm.iterrows():
             color="#404040"
         )
 
-# ---- 5d) Frame / extent / title ----
-# Set map extent to NZ polygon bounds with a small padding
+# 6d) 视图范围 & 标题
 minx, miny, maxx, maxy = nz_poly.total_bounds
 pad_x = (maxx - minx) * 0.05
 pad_y = (maxy - miny) * 0.05
 ax.set_xlim(minx - pad_x, maxx + pad_x)
 ax.set_ylim(miny - pad_y, maxy + pad_y)
-
-ax.set_title("NZ Weather Stations: Missing Months (darker = more missing)", fontsize=12)
 ax.set_axis_off()
 
-# === 6) Create a separate colorbar axis at the far right ===
-# [left, bottom, width, height] in figure coordinates
-# Increase 'left' to push further right; adjust 'width' for thicker/thinner bar.
-cax = fig.add_axes([0.92, 0.15, 0.02, 0.7])  # right-aligned standalone colorbar
-
-# Build scalar mappable matching the point layer
-sm = plt.cm.ScalarMappable(
-    cmap="Reds",
-    norm=plt.Normalize(vmin=vmin, vmax=vmax)
+ax.set_title(
+    "Uneven Sample Sizes Across Stations (darker = more data): Implications for Nationwide Aggregation",
+    fontsize=12
 )
-sm._A = []  # compatibility for older Matplotlib
 
+# 6e) 独立色条（右侧）
+cax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+sm = plt.cm.ScalarMappable(cmap="Blues",
+                           norm=plt.Normalize(vmin=vmin, vmax=vmax))
+sm._A = []
 cbar = fig.colorbar(sm, cax=cax)
-cbar.set_label("Missing Months", fontsize=10)
+cbar.set_label("Distinct Observation Days", fontsize=10)
 
 plt.show()
