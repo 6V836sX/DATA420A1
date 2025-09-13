@@ -1,45 +1,54 @@
-# === 0) Dependencies ===
-# pip install geopandas pyproj shapely matplotlib  (if missing)
-
 import geopandas as gpd
-import pandas as pd
 import matplotlib.pyplot as plt
+import pandas as pd
 
-# === 1) Convert Spark DataFrame to pandas with required columns ===
-# Make sure your Spark DataFrame has columns: ID, LATITUDE, LONGITUDE
+# === 1) Convert Spark DataFrames to pandas ===
+# Station locations (ID, LATITUDE, LONGITUDE)
 nz_pdf = (nz_station_loc
           .select("ID", "LATITUDE", "LONGITUDE")
           .toPandas())
 
-# === 2) Build GeoDataFrame with point geometries (lon=x, lat=y) ===
+# Missing stats (ID, missing_year_total, missing_month_total)
+missing_pdf = daily_nz_tmin_tmax_missing_stats.toPandas()
+
+# === 2) Merge by station ID ===
+merged = pd.merge(nz_pdf, missing_pdf, on="ID", how="left")
+
+# === 3) Create GeoDataFrame ===
 gdf_pts = gpd.GeoDataFrame(
-    nz_pdf,
-    geometry=gpd.points_from_xy(nz_pdf["LONGITUDE"], nz_pdf["LATITUDE"]),
-    crs="EPSG:4326"   # WGS84 geographic coordinates
+    merged,
+    geometry=gpd.points_from_xy(merged["LONGITUDE"], merged["LATITUDE"]),
+    crs="EPSG:4326"
 )
 
-# === 3) Load New Zealand polygon from built-in Natural Earth dataset ===
+# Reproject to NZTM2000
+gdf_pts_nztm = gdf_pts.to_crs(2193)
+
+# === 4) Load New Zealand polygon (Natural Earth dataset) ===
 world = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres"))
 nz_poly = world[world["name"] == "New Zealand"].to_crs(2193)
 
-# Reproject station points to NZTM2000 (EPSG:2193)
-gdf_pts_nztm = gdf_pts.to_crs(2193)
+# === 5) Plot with colormap ===
+fig, ax = plt.subplots(figsize=(8, 8))
 
-# === 4) Plot map ===
-fig, ax = plt.subplots(figsize=(7.5, 7.5))
-
-# Draw New Zealand boundary
+# Draw NZ polygon
 nz_poly.plot(ax=ax, edgecolor="black", linewidth=0.6, alpha=0.15)
 
-# Draw station points
-gdf_pts_nztm.plot(ax=ax, markersize=40, color="red")
+# Plot stations with color based on missing_month_total
+gdf_pts_nztm.plot(
+    ax=ax,
+    column="missing_month_total",   # color by missing data
+    cmap="Reds",                    # red colormap (light=low, dark=high)
+    markersize=80,
+    legend=True
+)
 
-# Optional: label station IDs (may overlap if points are close)
+# Add optional labels
 for _, r in gdf_pts_nztm.iterrows():
     ax.annotate(r["ID"], xy=(r.geometry.x, r.geometry.y),
                 xytext=(3, 3), textcoords="offset points", fontsize=7)
 
-ax.set_title("New Zealand Weather Stations (NZTM2000)", fontsize=12)
+ax.set_title("NZ Weather Stations: Missing Months (darker = more missing)", fontsize=12)
 ax.set_axis_off()
 plt.tight_layout()
 plt.show()
