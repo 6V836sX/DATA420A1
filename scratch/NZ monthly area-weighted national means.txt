@@ -2,11 +2,16 @@
 # NZ monthly area-weighted national means for TMIN / TMAX
 # Time stratification (by month) + Voronoi area weights + availability renormalization
 # --------------------------------------------
-import pandas as pd
-import numpy as np
-import geopandas as gpd
+
 from shapely.ops import voronoi_diagram
 
+
+daily_nz_tm_wide = (
+    daily_nz_tmin_tmax
+    .groupBy("ID","DATE")
+    .pivot("ELEMENT",["TMIN","TMAX"])
+    .agg(F.first("VALUE"))
+)
 # ========= 0) PARAMETERS =========
 # 月度有效性的日数阈值（例如：一个月至少20天有观测才认为该月有效）
 MIN_DAYS_PER_MONTH = 20
@@ -16,7 +21,7 @@ MIN_DAYS_PER_MONTH = 20
 # nz_station_loc: Spark DataFrame with columns: ID, LATITUDE, LONGITUDE
 
 # to pandas
-daily_pdf = daily_nz_tmin_tmax.select("ID", "DATE", "TMIN", "TMAX").toPandas().copy()
+daily_pdf = daily_nz_tm_wide.select("ID", "DATE", "TMIN", "TMAX").toPandas().copy()
 stations_pdf = nz_station_loc.select("ID", "LATITUDE", "LONGITUDE").toPandas().copy()
 
 # parse dates & make month_start
@@ -69,6 +74,7 @@ weights_df = (cell_to_station
 # 归一化权重 w_i
 weights_df["w"] = weights_df["area_total"] / weights_df["area_total"].sum()
 
+
 # ========= 4) MERGE WEIGHTS WITH STATION-MONTH TABLE =========
 aligned = monthly_station.merge(weights_df[["ID", "w"]], on="ID", how="left")
 
@@ -106,6 +112,7 @@ ax.set_title("NZ Area-Weighted National Monthly Mean (time-stratified, Voronoi w
 ax.set_ylabel("°C")
 ax.legend()
 fig.autofmt_xdate()
+plt.savefig("./supplementary/National_monthly_TM_avg.png")
 plt.show()
 
 # 结果表：nz_monthly_avg  ->  [month_start, TMIN_nzavg, TMAX_nzavg, n_used_TMIN, n_used_TMAX]
