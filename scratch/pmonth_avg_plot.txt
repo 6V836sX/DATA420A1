@@ -1,25 +1,3 @@
-# ===== 0) Spark→Pandas：拿到“宽表”(每行一个ID-年-月，列含TMIN.avg/TMAX.avg) =====
-# 你的变量名是 pmonth_avg（见截图），也可能是 monthly_agg，下面统一用 pmonth_avg
-
-from pyspark.sql import functions as F
-spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
-
-pdf = pmonth_avg.toPandas()  # 列：ID, year, month, TMIN.avg, TMAX.avg
-
-# 统一列名（句点不便于 pandas 操作）
-pdf = pdf.rename(columns={"TMIN.avg": "TMIN_avg", "TMAX.avg": "TMAX_avg"})
-
-# 生成每月第一天时间戳
-import pandas as pd
-pdf["month_start"] = pd.to_datetime(
-    pdf["year"].astype(str) + "-" + pdf["month"].astype(str) + "-01",
-    errors="coerce"
-)
-
-# （可选）若数据单位为 0.1℃，转为 ℃
-# pdf["TMIN_avg"] = pdf["TMIN_avg"] / 10.0
-# pdf["TMAX_avg"] = pdf["TMAX_avg"] / 10.0
-
 # 仅保留绘图需要列 & 类型优化
 pdf = pdf[["ID", "month_start", "TMIN_avg", "TMAX_avg"]]
 pdf["ID"] = pdf["ID"].astype("category")
@@ -29,7 +7,7 @@ full_index = pd.date_range("1940-01-01", "2025-12-01", freq="MS")  # Month Start
 
 def reindex_station(g):
     g = (g.set_index("month_start")[["TMIN_avg", "TMAX_avg"]]
-           .reindex(full_index))  # 缺的变 NaN → 画图时断线
+           .reindex(full_index))  # missing value to NaN → no data when plotting
     g.index.name = "month_start"
     return g
 
@@ -39,18 +17,18 @@ for sid, g in pdf.groupby("ID", observed=True):
     gg["ID"] = sid
     blocks.append(gg.reset_index())
 
-aligned = pd.concat(blocks, ignore_index=True)   # 列：month_start, TMIN_avg, TMAX_avg, ID
+aligned = pd.concat(blocks, ignore_index=True)   # col：month_start, TMIN_avg, TMAX_avg, ID
 aligned = aligned[["ID", "month_start", "TMIN_avg", "TMAX_avg"]]
 
-# ===== 2) 选择要画的 15 个站点（如你已有一个列表 selected_ids，可替换下一行）=====
+# ===== 2) plotting 15 station setup（customised available when you use selected_ids to replace next line）=====
 ids_all = aligned["ID"].astype("category").cat.categories.tolist()
-ids_15 = ids_all[:15]   # 或者自定义：ids_15 = ["NZ000093012", "...", ...]
+ids_15 = ids_all[:15]   # or customisation：ids_15 = ["NZ000093012", "...", ...]
 
-# ===== 3) 绘图：15个subplot（同一坐标轴上画 TMIN / TMAX，统一x轴范围） =====
+# ===== 3) 15 subplots（同一坐标轴上画 TMIN / TMAX，统一x轴范围） =====
 import matplotlib.pyplot as plt
 
 nrows, ncols = 3, 5
-fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(20, 10), sharex=True)
+fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(20, 10), sharex=False)
 axes = axes.ravel()
 
 x_min = pd.Timestamp("1940-01-01")
@@ -64,15 +42,15 @@ for ax, sid in zip(axes, ids_15):
     ax.set_xlim(x_min, x_max)
     ax.grid(True, alpha=0.3)
 
-# 隐藏空白子图
+# hide balck subplot
 for k in range(len(ids_15), len(axes)):
     axes[k].axis("off")
 
-# 页面级别图例（底部居中）
+# page level layout
 handles, labels = axes[0].get_legend_handles_labels()
 fig.legend(handles, labels, loc="lower center", ncol=2)
 
 fig.suptitle("NZ Stations • Monthly Mean TMIN/TMAX (NaN gaps, aligned 1940–2025)", y=0.98, fontsize=12)
 fig.tight_layout(rect=[0, 0.04, 1, 0.96])
-# plt.show()
-# fig.savefig("nz_tmin_tmax_monthly_15stations.png", dpi=150)
+plt.show()
+fig.savefig("./supplementary/nz_15stations_tmin_tmax_monthly_avg.png", dpi=300)
