@@ -1,0 +1,54 @@
+import cartopy.crs as ccrs
+from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
+
+# 地图坐标轴用 Robinson
+proj = ccrs.Robinson()
+fig = plt.figure(figsize=(16, 8))
+ax = plt.axes(projection=proj)
+
+# 数据坐标：WGS84（经纬度）
+gdf_wgs84 = world.to_crs("EPSG:4326")
+
+# 用 GeoPandas 画底图到普通 Axes 不会带 transform；
+# 这里逐个 geometry 加到 GeoAxes，并指定 transform=PlateCarree（经纬度）
+import matplotlib as mpl
+import numpy as np
+import matplotlib.cm as cm
+
+# 根据数值生成颜色
+vals = gdf_wgs84["PRCP_2024_country_avg"]
+cmap = cm.get_cmap("YlGnBu")
+norm = mpl.colors.Normalize(vmin=np.nanmin(vals), vmax=np.nanmax(vals))
+
+for _, row in gdf_wgs84.iterrows():
+    facecolor = "#f0f0f0" if pd.isna(row["PRCP_2024_country_avg"]) else cmap(norm(row["PRCP_2024_country_avg"]))
+    ax.add_geometries(
+        [row.geometry],
+        crs=ccrs.PlateCarree(),
+        facecolor=facecolor,
+        edgecolor="#d3d9df",
+        linewidth=0.4,
+        hatch="///" if pd.isna(row["PRCP_2024_country_avg"]) else None,
+        zorder=1
+    )
+
+# 颜色条
+sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+sm.set_array([])
+cbar = plt.colorbar(sm, ax=ax, fraction=0.03, pad=0.02)
+cbar.set_label("Average rainfall in 2024")
+
+# 网格线与经纬度度数标签
+gl = ax.gridlines(draw_labels=True, linewidth=0.5, linestyle="--")
+gl.top_labels = False
+gl.right_labels = False
+gl.xformatter = LONGITUDE_FORMATTER
+gl.yformatter = LATITUDE_FORMATTER
+gl.xlocator = mpl.ticker.FixedLocator(np.arange(-180, 181, 60))
+gl.ylocator = mpl.ticker.FixedLocator(np.arange(-90, 91, 30))
+
+ax.set_title("Average Rainfall by Country (2024)\nCRS: ESRI:54030 (Robinson)  •  Grey hatched = No data", fontsize=13)
+
+plt.tight_layout()
+plt.savefig("./supplementary/precip_2024_choropleth_robinson_cartopy.png", dpi=220, bbox_inches="tight")
+plt.show()
