@@ -1,0 +1,22 @@
+# 0)（可选但强烈建议）先把远端 main 备份一份到本地分支，防误操作
+git fetch origin || true
+git branch backup/origin-main origin/main 2>/dev/null || true
+# 现在即使覆盖了远端，也还能用 backup/origin-main 找回
+
+# 1) 确保这是 git 仓库并设置身份（只在当前仓库生效）
+git init 2>/dev/null || true
+git config user.name  "6V836sX"
+git config user.email "yxi75@uclive.ac.nz"   # 或你的 GitHub noreply 邮箱
+
+# 2) 设定分支名为 main
+git branch -M main
+
+# 3) 添加远端（若已存在会报错无妨）
+git remote add origin git@github.com:6V836sX/DATA420A1.git 2>/dev/null || true
+
+# 4) 提交当前改动（这里只提交 notebook，避免把大文件推上去；需要全量就改成 `git add -A`）
+git add *.ipynb
+git commit -m "cluster: authoritative sync (make cluster the source of truth)" || true
+
+# 5) 以 cluster 为主覆盖远端（安全写法：--force-with-lease）
+git push --force-with-lease -u origin main
