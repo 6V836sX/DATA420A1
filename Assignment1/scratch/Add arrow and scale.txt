@@ -1,0 +1,14 @@
+# === Add North Arrow ===
+x, y, arrow_length = 0.95, 0.1, 0.08
+ax.annotate('N', xy=(x, y + arrow_length), xytext=(x, y),
+            xycoords='axes fraction', ha='center', va='center',
+            fontsize=12, arrowprops=dict(facecolor='black', width=2, headwidth=8))
+
+# === Add Scale Bar ===
+scalebar_length = 100000  # 100 km
+scalebar_x = minx + (maxx - minx) * 0.1
+scalebar_y = miny + (maxy - miny) * 0.05
+ax.plot([scalebar_x, scalebar_x + scalebar_length], [scalebar_y, scalebar_y],
+        color="black", linewidth=2)
+ax.text(scalebar_x + scalebar_length / 2, scalebar_y - (maxy - miny) * 0.02,
+        "100 km", ha="center", va="top", fontsize=9)
